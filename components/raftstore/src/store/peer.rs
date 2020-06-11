@@ -193,6 +193,8 @@ pub struct Peer {
     pub pending_remove: bool,
     /// If a snapshot is being applied asynchronously, messages should not be sent.
     pending_messages: Vec<eraftpb::Message>,
+    pub stash_messages: Vec<RaftMessage>,
+    pub stash_committed_entries: Vec<eraftpb::Entry>,
 
     /// Record the instants of peers being added into the configuration.
     /// Remove them after they are not pending any more.
@@ -323,6 +325,8 @@ impl Peer {
             raft_log_size_hint: 0,
             leader_lease: Lease::new(cfg.raft_store_max_leader_lease()),
             pending_messages: vec![],
+            stash_messages: vec![],
+            stash_committed_entries: vec![],
             peer_stat: PeerStat::default(),
             catch_up_logs: None,
             bcast_wake_up_time: None,
@@ -759,6 +763,7 @@ impl Peer {
             return Ok(());
         }
 
+
         self.raft_group.step(m)?;
         Ok(())
     }
@@ -962,11 +967,6 @@ impl Peer {
             ctx.coprocessor_host
                 .on_role_change(self.region(), ss.raft_state);
         }
-    }
-
-    pub fn on_sync(&mut self, idx: u64) {
-        self.raft_group.raft.on_sync(idx);
-        self.mut_store().on_sync(idx);
     }
 
     #[inline]
@@ -1183,30 +1183,8 @@ impl Peer {
             }
         }
 
-
-        let must_sync = if ctx.cfg.delay_sync_ns == 0 {
-            if !ctx.sync_log {
-                ctx.raft_metrics.sync_log_reason.delay_sync_not_enabled += 1;
-            }
-            true
-        } else if self.raft_group.has_must_sync_ready() {
-            if !ctx.sync_log {
-                ctx.raft_metrics.sync_log_reason.must_sync_ready += 1;
-            }
-            true
-        } else {
-            false
-        };
-        if must_sync {
-            ctx.sync_log = true;
-        }
-
         // Committed log may not sync yet in this instance
-        let has_ready = if must_sync {
-            self.raft_group.has_ready_since(Some((self.last_applying_idx, None)))
-        } else {
-            self.raft_group.has_ready_since(Some((self.last_applying_idx, Some(self.get_store().synced_idx))))
-        };
+        let has_ready = self.raft_group.has_ready_since(Some(self.last_applying_idx));
 
         if !has_ready {
             // Generating snapshot task won't set ready for raft group.
@@ -1234,11 +1212,7 @@ impl Peer {
         };
         before_handle_raft_ready_1003();
 
-        let mut ready = if must_sync {
-            self.raft_group.ready_since(self.last_applying_idx)
-        } else {
-            self.raft_group.ready_from_range(self.last_applying_idx, self.get_store().synced_idx)
-        };
+        let mut ready = self.raft_group.ready_since(self.last_applying_idx);
 
         self.on_role_changed(ctx, &ready);
 
@@ -1345,7 +1319,9 @@ impl Peer {
         // in `ready.committed_entries` again, which will lead to inconsistency.
         if raft::is_empty_snap(ready.snapshot()) {
             debug_assert!(!invoke_ctx.has_snapshot() && !self.get_store().is_applying_snapshot());
-            let committed_entries = ready.committed_entries.take().unwrap();
+            let mut committed_entries = ready.committed_entries.take().unwrap();
+            let mut unsynced_entries = committed_entries.drain_filter(|e| e.get_index() > self.get_store().synced_idx).collect();
+            self.stash_committed_entries.append(&mut unsynced_entries);
             // leader needs to update lease and last committed split index.
             let mut lease_to_be_updated = self.is_leader();
             let mut split_to_be_updated = self.is_leader();

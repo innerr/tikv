@@ -362,6 +362,15 @@ impl<T: Transport + 'static, C> PollContext<T, C> {
     pub fn store_id(&self) -> u64 {
         self.store.get_id()
     }
+
+    pub fn flush_cached(&mut self) {
+        self.trans.send_cached();
+        for (region_id, idx) in self.unsynced_regions.drain() {
+            self.router
+                .send(region_id, PeerMsg::Synced(idx))
+                .unwrap();
+        }
+    }
 }
 
 impl<T: Transport, C> PollContext<T, C> {
@@ -638,13 +647,7 @@ impl<T: Transport, C: PdClient> RaftPoller<T, C> {
                 let last_sync_ts = self.poll_ctx.global_last_sync_time.load(Ordering::SeqCst);
                 if last_sync_ts > self.poll_ctx.local_last_sync_time {
                     self.poll_ctx.local_last_sync_time = last_sync_ts;
-                    self.poll_ctx.trans.send_cached();
-                    for (region_id, idx) in self.poll_ctx.unsynced_regions.drain() {
-                        self.poll_ctx
-                            .router
-                            .send(region_id, PeerMsg::Synced(idx))
-                            .unwrap();
-                    }
+                    self.poll_ctx.flush_cached();
                 }
                 let elapsed = current_ts - last_sync_ts;
                 if elapsed > self.poll_ctx.cfg.delay_sync_ns as i64 {
@@ -654,7 +657,10 @@ impl<T: Transport, C: PdClient> RaftPoller<T, C> {
                     self.poll_ctx.raft_metrics.sync_log_reason.not_reach_deadline += 1;
                 }
             }
+        } else {
+            self.poll_ctx.raft_metrics.sync_log_reason.must_sync_ready += 1;
         }
+
         if !self.poll_ctx.raft_wb.is_empty() {
             fail_point!(
                 "raft_before_save_on_store_1",
@@ -686,19 +692,13 @@ impl<T: Transport, C: PdClient> RaftPoller<T, C> {
                 .global_last_sync_time
                 .store(current_ts, Ordering::Relaxed);
             self.poll_ctx.local_last_sync_time = current_ts;
-            self.poll_ctx.trans.send_cached();
-            for (region_id, idx) in self.poll_ctx.unsynced_regions.drain() {
-                self.poll_ctx
-                    .router
-                    .send(region_id, PeerMsg::Synced(idx))
-                    .unwrap();
-            }
+            self.poll_ctx.flush_cached();
         }
 
         if ready_cnt != 0 {
             let mut batch_pos = 0;
             let mut ready_res = mem::replace(&mut self.poll_ctx.ready_res, Vec::default());
-            for (ready, invoke_ctx) in ready_res.drain(..) {
+            for (mut ready, invoke_ctx) in ready_res.drain(..) {
                 let region_id = invoke_ctx.region_id;
                 if peers[batch_pos].region_id() == region_id {
                 } else {
@@ -706,16 +706,26 @@ impl<T: Transport, C: PdClient> RaftPoller<T, C> {
                         batch_pos += 1;
                     }
                 }
-                PeerFsmDelegate::new(&mut peers[batch_pos], &mut self.poll_ctx)
-                    .post_raft_ready_append(ready, invoke_ctx);
                 let idx = peers[batch_pos].peer.raft_group.raft.raft_log.last_index();
                 if sync {
-                    peers[batch_pos].peer.on_sync(idx);
+                    peers[batch_pos].peer.mut_store().on_sync(idx);
                 } else {
                     self.poll_ctx
                         .unsynced_regions
                         .insert((region_id, idx));
+                } 
+                let synced_idx =  peers[batch_pos].peer.get_store().synced_idx;
+                let mut e = peers[batch_pos].peer.stash_committed_entries.drain_filter(|e| e.get_index() < synced_idx).collect::<Vec<_>>();
+                if !e.is_empty() {
+                    let mut o = ready.committed_entries.take().unwrap();
+                    if !o.is_empty() {
+                        assert_eq!(e.last().unwrap().get_index(), o.first().unwrap().get_index());
+                    }
+                    e.append(&mut o);
+                    ready.committed_entries = Some(e);
                 }
+                PeerFsmDelegate::new(&mut peers[batch_pos], &mut self.poll_ctx)
+                    .post_raft_ready_append(ready, invoke_ctx);
             }
         }
         let dur = self.timer.elapsed();
@@ -887,13 +897,7 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm<RocksEngine>, StoreFsm> for 
                 self.poll_ctx.local_last_sync_time = current_ts;
                 self.poll_ctx.raft_metrics.sync_log_reason.reach_deadline_without_ready += 1;
                 self.poll_ctx.raft_metrics.sync_log_interval.observe(elapsed as f64 / 1_000_000_000.0);
-                self.poll_ctx.trans.send_cached();
-                for (region_id, idx) in self.poll_ctx.unsynced_regions.drain() {
-                    self.poll_ctx
-                        .router
-                        .send(region_id, PeerMsg::Synced(idx))
-                        .unwrap();
-                }
+                self.poll_ctx.flush_cached();
             }
         }
         if self.poll_ctx.need_flush_trans {
@@ -922,23 +926,11 @@ impl<T: Transport, C: PdClient> RaftPoller<T, C> {
             self.poll_ctx.local_last_sync_time = current_ts;
             self.poll_ctx.raft_metrics.sync_log_reason.reach_deadline_without_ready += 1;
             self.poll_ctx.raft_metrics.sync_log_interval.observe(elapsed as f64 / 1_000_000_000.0);
-            self.poll_ctx.trans.send_cached();
-            for (region_id, idx) in self.poll_ctx.unsynced_regions.drain() {
-                self.poll_ctx
-                    .router
-                    .send(region_id, PeerMsg::Synced(idx))
-                    .unwrap();
-            }
+            self.poll_ctx.flush_cached();
             return true;
         } else if last_sync_ts > self.poll_ctx.local_last_sync_time {
             self.poll_ctx.local_last_sync_time = last_sync_ts;
-            self.poll_ctx.trans.send_cached();
-            for (region_id, idx) in self.poll_ctx.unsynced_regions.drain() {
-                self.poll_ctx
-                    .router
-                    .send(region_id, PeerMsg::Synced(idx))
-                    .unwrap();
-            }
+            self.poll_ctx.flush_cached();
             return true;
         }
         return false;
