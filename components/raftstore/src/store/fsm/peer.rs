@@ -267,7 +267,7 @@ impl<E: KvEngine> Fsm for PeerFsm<E> {
     }
 }
 
-pub struct PeerFsmDelegate<'a, T: 'static, C: 'static> {
+pub struct PeerFsmDelegate<'a, T: Transport + 'static, C: 'static> {
     fsm: &'a mut PeerFsm<RocksEngine>,
     ctx: &'a mut PollContext<T, C>,
 }
@@ -314,6 +314,25 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
                     }
                 }
                 PeerMsg::Noop => {}
+                PeerMsg::Synced(idx) => {
+                    self.fsm.peer.mut_store().on_sync(idx);
+                    let msgs = self.fsm.peer.stash_messages.drain_filter(|m| m.get_message().get_index() <= idx).collect::<Vec<_>>(); 
+                    for msg in msgs {
+                        if let Err(e) = self.on_raft_message(msg) {
+                            error!(
+                                "handle raft message err";
+                                "region_id" => self.fsm.region_id(),
+                                "peer_id" => self.fsm.peer_id(),
+                                "err" => %e,
+                            );
+                        }
+                    }
+                },
+                PeerMsg::AsyncMsgFailed(info) => self.fsm.peer.on_send_err(
+                    info.to_leader,
+                    info.is_snapshot_msg,
+                    info.to_peer_id
+                ),
             }
         }
     }
@@ -842,6 +861,13 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
             "from_peer_id" => msg.get_from_peer().get_id(),
             "to_peer_id" => msg.get_to_peer().get_id(),
         );
+        
+        if msg.get_message().get_msg_type() == MessageType::MsgAppendResponse {
+            if msg.get_message().get_reject() == false && msg.get_message().get_index() > self.fsm.peer.get_store().synced_idx {
+                self.fsm.peer.stash_messages.push(msg);
+                return Ok(());
+            }
+        }
 
         if !self.validate_raft_msg(&msg) {
             return Ok(());

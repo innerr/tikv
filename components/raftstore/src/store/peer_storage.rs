@@ -524,6 +524,8 @@ pub struct PeerStorage {
     stats: CacheQueryStats,
 
     pub tag: String,
+
+    pub synced_idx: u64,
 }
 
 impl Storage for PeerStorage {
@@ -578,6 +580,7 @@ impl PeerStorage {
         }
         let last_term = init_last_term(&engines, region, &raft_state, &apply_state)?;
         let applied_index_term = init_applied_index_term(&engines, region, &apply_state)?;
+        let applied_index = (&apply_state).applied_index;
 
         Ok(PeerStorage {
             engines,
@@ -594,6 +597,7 @@ impl PeerStorage {
             last_term,
             cache: EntryCache::default(),
             stats: CacheQueryStats::default(),
+            synced_idx: applied_index,
         })
     }
 
@@ -618,6 +622,10 @@ impl PeerStorage {
             hard_state,
             conf_state_from_region(self.region()),
         ))
+    }
+
+    pub fn on_sync(&mut self, idx: u64) {
+        self.synced_idx = idx;
     }
 
     fn check_range(&self, low: u64, high: u64) -> raft::Result<()> {
@@ -811,6 +819,12 @@ impl PeerStorage {
     /// Gets a snapshot. Returns `SnapshotTemporarilyUnavailable` if there is no unavailable
     /// snapshot.
     pub fn snapshot(&self, request_index: u64) -> raft::Result<Snapshot> {
+        if self.synced_idx < request_index {
+            return Err(raft::Error::Store(
+                raft::StorageError::SnapshotTemporarilyUnavailable,
+            ));
+        }
+
         let mut snap_state = self.snap_state.borrow_mut();
         let mut tried_cnt = self.snap_tried_cnt.borrow_mut();
 
@@ -871,7 +885,7 @@ impl PeerStorage {
         let (tx, rx) = mpsc::sync_channel(1);
         *snap_state = SnapState::Generating(rx);
 
-        let task = GenSnapTask::new(self.region.get_id(), self.committed_index(), tx);
+        let task = GenSnapTask::new(self.region.get_id(), cmp::min(self.committed_index(), self.synced_idx), tx);
         let mut gen_snap_task = self.gen_snap_task.borrow_mut();
         assert!(gen_snap_task.is_none());
         *gen_snap_task = Some(task);

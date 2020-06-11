@@ -15,12 +15,14 @@ use kvproto::pdpb::StoreStats;
 use kvproto::raft_cmdpb::{AdminCmdType, AdminRequest};
 use kvproto::raft_serverpb::{PeerState, RaftMessage, RegionLocalState};
 use protobuf::Message;
+use libc;
+use raft::eraftpb::MessageType;
 use raft::{Ready, StateRole};
 use std::cmp::{Ord, Ordering as CmpOrdering};
 use std::collections::BTreeMap;
 use std::collections::Bound::{Excluded, Included, Unbounded};
 use std::ops::Deref;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{mem, thread, u64};
@@ -30,6 +32,7 @@ use tokio_threadpool::{Sender as ThreadPoolSender, ThreadPool};
 use crate::coprocessor::split_observer::SplitObserver;
 use crate::coprocessor::{BoxAdminObserver, CoprocessorHost, RegionChangeEvent};
 use crate::store::config::Config;
+use crate::store::util::timespec_to_nanos;
 use crate::store::fsm::metrics::*;
 use crate::store::fsm::peer::{
     maybe_destroy_source, new_admin_request, PeerFsm, PeerFsmDelegate, SenderFsmPair,
@@ -53,8 +56,8 @@ use crate::store::worker::{
 use crate::store::DynamicConfig;
 use crate::store::PdTask;
 use crate::store::{
-    util, Callback, CasualMessage, PeerMsg, RaftCommand, SignificantMsg, SnapManager,
-    SnapshotDeleter, StoreMsg, StoreTick,
+    util, Callback, CasualMessage, PeerMsg, PeerMsgIrrelevantInfo, RaftCommand, SignificantMsg,
+    SnapManager, SnapshotDeleter, StoreMsg, StoreTick,
 };
 use crate::Result;
 use engine_rocks::{CompactedEvent, CompactionListener};
@@ -197,7 +200,96 @@ impl<E: KvEngine> RaftRouter<E> {
     }
 }
 
-pub struct PollContext<T, C: 'static> {
+pub struct BlockableTransport<T: Transport + 'static> {
+    trans: T,
+    router: RaftRouter<RocksEngine>,
+    cache: Vec<(RaftMessage, PeerMsgIrrelevantInfo)>,
+    enabled: bool,
+}
+
+impl<T: Transport + 'static> BlockableTransport<T> {
+    pub fn new(trans: T, router: RaftRouter<RocksEngine>, enabled: bool) -> BlockableTransport<T> {
+        BlockableTransport {
+            trans,
+            router,
+            cache: vec![],
+            enabled: enabled,
+        }
+    }
+
+    pub fn maybe_cache_send(
+        &mut self,
+        msg: RaftMessage,
+        to_leader: bool,
+        is_snapshot_msg: bool,
+    ) -> Result<()> {
+        if !self.enabled {
+            return self.trans.send(msg);
+        }
+
+        // TODO: direct-send more messages that not depend on syncing
+        let msg_type = msg.get_message().get_msg_type();
+        if msg_type == MessageType::MsgHeartbeat || msg_type == MessageType::MsgHeartbeatResponse {
+            self.trans.send(msg)
+        } else {
+            let to_peer_id = msg.get_to_peer().get_id();
+            self.cache.push((
+                msg,
+                PeerMsgIrrelevantInfo {
+                    to_leader,
+                    is_snapshot_msg,
+                    to_peer_id,
+                },
+            ));
+            Ok(())
+        }
+    }
+
+    pub fn cached_count(&self) -> usize {
+        self.cache.len()
+    }
+
+    pub fn send_cached(&mut self) {
+        if self.cache.len() == 0 {
+            return;
+        }
+        for (msg, info) in self.cache.drain(..) {
+            let region_id = msg.get_region_id();
+            let from_peer_id = msg.get_from_peer().get_id();
+            let to_peer_id = msg.get_to_peer().get_id();
+            let res = self.trans.send(msg);
+            if let Err(err) = res {
+                warn!(
+                    "failed to send to other peer from transport cache";
+                    "region_id" => region_id,
+                    "peer_id" => from_peer_id,
+                    "target_peer_id" => to_peer_id,
+                    "err" => ?err,
+                );
+                self.router.send(region_id, PeerMsg::AsyncMsgFailed(info)).unwrap();
+            }
+        }
+        self.trans.flush();
+    }
+}
+
+impl<T: Transport + 'static> Transport for BlockableTransport<T> {
+    fn send(&mut self, msg: RaftMessage) -> Result<()> {
+        self.trans.send(msg)
+    }
+
+    fn flush(&mut self) {
+        self.trans.flush()
+    }
+}
+
+impl<T: Transport + 'static> Clone for BlockableTransport<T> {
+    fn clone(&self) -> BlockableTransport<T> {
+        BlockableTransport::new(self.trans.clone(), self.router.clone(), self.enabled)
+    }
+}
+
+pub struct PollContext<T: Transport + 'static, C: 'static> {
     pub cfg: Config,
     pub store: metapb::Store,
     pub pd_scheduler: FutureScheduler<PdTask>,
@@ -217,7 +309,7 @@ pub struct PollContext<T, C: 'static> {
     pub applying_snap_count: Arc<AtomicUsize>,
     pub coprocessor_host: CoprocessorHost,
     pub timer: SteadyTimer,
-    pub trans: T,
+    pub trans: BlockableTransport<T>,
     pub pd_client: Arc<C>,
     pub global_stat: GlobalStoreStat,
     pub store_stat: LocalStoreStat,
@@ -231,9 +323,12 @@ pub struct PollContext<T, C: 'static> {
     pub need_flush_trans: bool,
     pub queued_snapshot: HashSet<u64>,
     pub current_time: Option<Timespec>,
+    pub global_last_sync_time: Arc<AtomicI64>,
+    pub local_last_sync_time: i64,
+    pub unsynced_regions: HashSet<(u64, u64)>,
 }
 
-impl<T, C> HandleRaftReadyContext for PollContext<T, C> {
+impl<T: Transport + 'static, C> HandleRaftReadyContext for PollContext<T, C> {
     fn wb_mut(&mut self) -> (&mut RocksWriteBatch, &mut RocksWriteBatch) {
         (&mut self.kv_wb, &mut self.raft_wb)
     }
@@ -255,14 +350,26 @@ impl<T, C> HandleRaftReadyContext for PollContext<T, C> {
 
     #[inline]
     fn set_sync_log(&mut self, sync: bool) {
+        if !self.sync_log && sync {
+            self.raft_metrics.sync_log_reason.peer_storage_require += 1;
+        }
         self.sync_log = sync;
     }
 }
 
-impl<T, C> PollContext<T, C> {
+impl<T: Transport + 'static, C> PollContext<T, C> {
     #[inline]
     pub fn store_id(&self) -> u64 {
         self.store.get_id()
+    }
+
+    pub fn flush_cached(&mut self) {
+        self.trans.send_cached();
+        for (region_id, idx) in self.unsynced_regions.drain() {
+            self.router
+                .send(region_id, PeerMsg::Synced(idx))
+                .unwrap();
+        }
     }
 }
 
@@ -383,7 +490,7 @@ impl Fsm for StoreFsm {
     }
 }
 
-struct StoreFsmDelegate<'a, T: 'static, C: 'static> {
+struct StoreFsmDelegate<'a, T: Transport + 'static, C: 'static> {
     fsm: &'a mut StoreFsm,
     ctx: &'a mut PollContext<T, C>,
 }
@@ -460,7 +567,7 @@ impl<'a, T: Transport, C: PdClient> StoreFsmDelegate<'a, T, C> {
     }
 }
 
-pub struct RaftPoller<T: 'static, C: 'static> {
+pub struct RaftPoller<T: Transport + 'static, C: 'static> {
     tag: String,
     store_msg_buf: Vec<StoreMsg>,
     peer_msg_buf: Vec<PeerMsg<RocksEngine>>,
@@ -527,6 +634,33 @@ impl<T: Transport, C: PdClient> RaftPoller<T, C> {
             }
         }
         fail_point!("raft_between_save");
+        let mut sync = self.poll_ctx.sync_log;
+        let current_ts = timespec_to_nanos(TiInstant::now_coarse());
+        if !sync { // if delay_sync_ns == 0, sync must be true
+            if self.poll_ctx.trans.cached_count() > 4096 {
+                self.poll_ctx
+                    .raft_metrics
+                    .sync_log_reason
+                    .trans_cache_is_full += 1;
+                sync = true;
+            } else {
+                let last_sync_ts = self.poll_ctx.global_last_sync_time.load(Ordering::SeqCst);
+                if last_sync_ts > self.poll_ctx.local_last_sync_time {
+                    self.poll_ctx.local_last_sync_time = last_sync_ts;
+                    self.poll_ctx.flush_cached();
+                }
+                let elapsed = current_ts - last_sync_ts;
+                if elapsed > self.poll_ctx.cfg.delay_sync_ns as i64 {
+                    self.poll_ctx.raft_metrics.sync_log_reason.reach_deadline += 1;
+                    sync = true;
+                } else {
+                    self.poll_ctx.raft_metrics.sync_log_reason.not_reach_deadline += 1;
+                }
+            }
+        } else {
+            self.poll_ctx.raft_metrics.sync_log_reason.must_sync_ready += 1;
+        }
+
         if !self.poll_ctx.raft_wb.is_empty() {
             fail_point!(
                 "raft_before_save_on_store_1",
@@ -534,7 +668,7 @@ impl<T: Transport, C: PdClient> RaftPoller<T, C> {
                 |_| {}
             );
             let mut write_opts = WriteOptions::new();
-            write_opts.set_sync(self.poll_ctx.cfg.sync_log || self.poll_ctx.sync_log);
+            write_opts.set_sync(sync);
             self.poll_ctx
                 .engines
                 .raft
@@ -550,16 +684,45 @@ impl<T: Transport, C: PdClient> RaftPoller<T, C> {
             }
         }
         fail_point!("raft_after_save");
+
+        if sync && self.poll_ctx.cfg.delay_sync_ns != 0 {
+            let elapsed = current_ts - self.poll_ctx.global_last_sync_time.load(Ordering::SeqCst);
+            self.poll_ctx.raft_metrics.sync_log_interval.observe(elapsed as f64 / 1_000_000_000.0);
+            self.poll_ctx
+                .global_last_sync_time
+                .store(current_ts, Ordering::Relaxed);
+            self.poll_ctx.local_last_sync_time = current_ts;
+            self.poll_ctx.flush_cached();
+        }
+
         if ready_cnt != 0 {
             let mut batch_pos = 0;
             let mut ready_res = mem::replace(&mut self.poll_ctx.ready_res, Vec::default());
-            for (ready, invoke_ctx) in ready_res.drain(..) {
+            for (mut ready, invoke_ctx) in ready_res.drain(..) {
                 let region_id = invoke_ctx.region_id;
                 if peers[batch_pos].region_id() == region_id {
                 } else {
                     while peers[batch_pos].region_id() != region_id {
                         batch_pos += 1;
                     }
+                }
+                let idx = peers[batch_pos].peer.raft_group.raft.raft_log.last_index();
+                if sync {
+                    peers[batch_pos].peer.mut_store().on_sync(idx);
+                } else {
+                    self.poll_ctx
+                        .unsynced_regions
+                        .insert((region_id, idx));
+                } 
+                let synced_idx =  peers[batch_pos].peer.get_store().synced_idx;
+                let mut e = peers[batch_pos].peer.stash_committed_entries.drain_filter(|e| e.get_index() < synced_idx).collect::<Vec<_>>();
+                if !e.is_empty() {
+                    let mut o = ready.committed_entries.take().unwrap();
+                    if !o.is_empty() {
+                        assert_eq!(e.last().unwrap().get_index(), o.first().unwrap().get_index());
+                    }
+                    e.append(&mut o);
+                    ready.committed_entries = Some(e);
                 }
                 PeerFsmDelegate::new(&mut peers[batch_pos], &mut self.poll_ctx)
                     .post_raft_ready_append(ready, invoke_ctx);
@@ -688,6 +851,7 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm<RocksEngine>, StoreFsm> for 
                 }
             }
         }
+
         let mut delegate = PeerFsmDelegate::new(peer, &mut self.poll_ctx);
         delegate.handle_msgs(&mut self.peer_msg_buf);
         delegate.collect_ready(&mut self.pending_proposals);
@@ -697,6 +861,8 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm<RocksEngine>, StoreFsm> for 
     fn end(&mut self, peers: &mut [Box<PeerFsm<RocksEngine>>]) {
         if self.poll_ctx.has_ready {
             self.handle_raft_ready(peers);
+        } else if self.poll_ctx.cfg.delay_sync_ns != 0 {
+            self.check_sync();
         }
         self.poll_ctx.current_time = None;
         if !self.poll_ctx.queued_snapshot.is_empty() {
@@ -714,10 +880,60 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm<RocksEngine>, StoreFsm> for 
     }
 
     fn pause(&mut self) {
+        if self.poll_ctx.cfg.delay_sync_ns != 0 {
+            std::thread::sleep(std::time::Duration::from_nanos(self.poll_ctx.cfg.delay_sync_ns));
+            if !self.check_sync() && (self.poll_ctx.trans.cached_count() != 0 || self.poll_ctx.unsynced_regions.len() != 0) {
+                let last_sync_ts = self.poll_ctx.global_last_sync_time.load(Ordering::SeqCst);
+                let current_ts = timespec_to_nanos(TiInstant::now_coarse());
+                let elapsed = current_ts - last_sync_ts;
+                unsafe {
+                    libc::sync();
+                }
+                // should update global_last_sync_time after sync is finished,
+                // or other threads would commit an unsynced log entry.
+                self.poll_ctx
+                    .global_last_sync_time
+                    .store(current_ts, Ordering::Relaxed);
+                self.poll_ctx.local_last_sync_time = current_ts;
+                self.poll_ctx.raft_metrics.sync_log_reason.reach_deadline_without_ready += 1;
+                self.poll_ctx.raft_metrics.sync_log_interval.observe(elapsed as f64 / 1_000_000_000.0);
+                self.poll_ctx.flush_cached();
+            }
+        }
         if self.poll_ctx.need_flush_trans {
             self.poll_ctx.trans.flush();
             self.poll_ctx.need_flush_trans = false;
         }
+    }
+}
+
+impl<T: Transport, C: PdClient> RaftPoller<T, C> {
+    fn check_sync(&mut self) -> bool {
+        let last_sync_ts = self.poll_ctx.global_last_sync_time.load(Ordering::SeqCst);
+        let current_ts = timespec_to_nanos(TiInstant::now_coarse());
+        let elapsed = current_ts - last_sync_ts;
+        // wait it a little bit longer, because it's better to let others threads with actual write to trigger fsync
+        if elapsed > self.poll_ctx.cfg.delay_sync_ns as i64 * 10 {
+            // TODO: maybe call rocksdb for a dummy write with sync
+            unsafe {
+                libc::sync();
+            }
+            // should update global_last_sync_time after sync is finished,
+            // or other threads would commit an unsynced log entry.
+            self.poll_ctx
+                .global_last_sync_time
+                .store(current_ts, Ordering::Relaxed);
+            self.poll_ctx.local_last_sync_time = current_ts;
+            self.poll_ctx.raft_metrics.sync_log_reason.reach_deadline_without_ready += 1;
+            self.poll_ctx.raft_metrics.sync_log_interval.observe(elapsed as f64 / 1_000_000_000.0);
+            self.poll_ctx.flush_cached();
+            return true;
+        } else if last_sync_ts > self.poll_ctx.local_last_sync_time {
+            self.poll_ctx.local_last_sync_time = last_sync_ts;
+            self.poll_ctx.flush_cached();
+            return true;
+        }
+        return false;
     }
 }
 
@@ -742,6 +958,7 @@ pub struct RaftPollerBuilder<T, C> {
     global_stat: GlobalStoreStat,
     pub engines: KvEngines<RocksEngine, RocksEngine>,
     applying_snap_count: Arc<AtomicUsize>,
+    last_sync_ts_in_ns: Arc<AtomicI64>,
 }
 
 impl<T, C> RaftPollerBuilder<T, C> {
@@ -936,7 +1153,11 @@ where
             applying_snap_count: self.applying_snap_count.clone(),
             coprocessor_host: self.coprocessor_host.clone(),
             timer: SteadyTimer::default(),
-            trans: self.trans.clone(),
+            trans: BlockableTransport::new(
+                self.trans.clone(),
+                self.router.clone(),
+                self.cfg.value().delay_sync_ns != 0
+            ),
             pd_client: self.pd_client.clone(),
             global_stat: self.global_stat.clone(),
             store_stat: self.global_stat.local(),
@@ -950,6 +1171,9 @@ where
             need_flush_trans: false,
             queued_snapshot: HashSet::default(),
             current_time: None,
+            global_last_sync_time: self.last_sync_ts_in_ns.clone(),
+            local_last_sync_time: self.last_sync_ts_in_ns.load(Ordering::SeqCst),
+            unsynced_regions: HashSet::default(),
         };
         let tag = format!("[store {}]", ctx.store.get_id());
         RaftPoller {
@@ -1053,6 +1277,7 @@ impl RaftBatchSystem {
             store_meta,
             applying_snap_count: Arc::new(AtomicUsize::new(0)),
             future_poller: workers.future_poller.sender().clone(),
+            last_sync_ts_in_ns: Arc::new(AtomicI64::new(timespec_to_nanos(TiInstant::now_coarse()))),
         };
         let region_peers = builder.init()?;
         let engine = builder.engines.kv.clone();

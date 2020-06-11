@@ -14,7 +14,7 @@ use time::{Duration, Timespec};
 
 use super::peer_storage;
 use crate::{Error, Result};
-use tikv_util::time::monotonic_raw_now;
+use tikv_util::time::{Instant, monotonic_raw_now};
 use tikv_util::Either;
 
 pub fn find_peer(region: &metapb::Region, store_id: u64) -> Option<&metapb::Peer> {
@@ -537,6 +537,17 @@ fn timespec_to_u64(ts: Timespec) -> u64 {
     let ms = ts.nsec >> TIMESPEC_NSEC_SHIFT;
     let sec = ts.sec << TIMESPEC_SEC_SHIFT;
     sec as u64 | ms as u64
+}
+
+#[inline]
+pub fn timespec_to_nanos(ins: Instant) -> i64 {
+    let ts = match ins {
+        Instant::Monotonic(ts) => ts,
+        Instant::MonotonicCoarse(ts) => ts,
+    };
+    assert!(ts.sec >= 0 && ts.sec < (1i64 << (64 - TIMESPEC_SEC_SHIFT)));
+    assert!(ts.nsec >= 0);
+    ts.sec * 1_000_000_000 + ts.nsec as i64
 }
 
 /// Convert Timespec to u64.

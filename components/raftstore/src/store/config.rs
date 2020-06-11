@@ -35,7 +35,7 @@ pub enum QuorumAlgorithm {
 #[serde(rename_all = "kebab-case")]
 pub struct Config {
     // true for high reliability, prevent data loss when power failure.
-    pub sync_log: bool,
+    pub delay_sync_ns: u64,
     // minimizes disruption when a partitioned node rejoins the cluster by using a two phase election.
     #[config(skip)]
     pub prevote: bool,
@@ -189,7 +189,7 @@ impl Default for Config {
     fn default() -> Config {
         let split_size = ReadableSize::mb(coprocessor::config::SPLIT_SIZE_MB);
         Config {
-            sync_log: true,
+            delay_sync_ns: 0,
             prevote: true,
             raftdb_path: String::new(),
             capacity: ReadableSize(0),
@@ -486,8 +486,8 @@ impl Config {
 
     pub fn write_into_metrics(&self) {
         CONFIG_RAFTSTORE_GAUGE
-            .with_label_values(&["sync_log"])
-            .set((self.sync_log as i32).into());
+            .with_label_values(&["delay_sync_ns"])
+            .set((self.delay_sync_ns as i32).into());
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["prevote"])
             .set((self.prevote as i32).into());
