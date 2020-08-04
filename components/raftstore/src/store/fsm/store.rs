@@ -562,6 +562,8 @@ pub struct RaftPoller<T: 'static, C: 'static> {
     poll_ctx: PollContext<RocksEngine, RocksEngine, T, C>,
     messages_per_tick: usize,
     cfg_tracker: Tracker<Config>,
+    last_sync_time: tikv_util::time::Instant,
+    batch_retry_recv_timeout: Duration,
 }
 
 impl<T: Transport, C: PdClient> RaftPoller<T, C> {
@@ -613,6 +615,7 @@ impl<T: Transport, C: PdClient> RaftPoller<T, C> {
         }
         fail_point!("raft_between_save");
         if !self.poll_ctx.raft_wb.is_empty() {
+            self.last_sync_time = tikv_util::time::Instant::now_coarse();
             fail_point!(
                 "raft_before_save_on_store_1",
                 self.poll_ctx.store_id() == 1,
@@ -802,6 +805,11 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm<RocksEngine, RocksEngine>, S
             self.poll_ctx.trans.flush();
             self.poll_ctx.need_flush_trans = false;
         }
+    }
+
+    fn batch_retry_recv_timeout(&self) -> Option<Duration> {
+        self.batch_retry_recv_timeout
+            .checked_sub(self.last_sync_time.elapsed())
     }
 }
 
@@ -1053,6 +1061,8 @@ where
             messages_per_tick: ctx.cfg.messages_per_tick,
             poll_ctx: ctx,
             cfg_tracker: self.cfg.clone().tracker(tag),
+            last_sync_time: tikv_util::time::Instant::now_coarse(),
+            batch_retry_recv_timeout: self.cfg.value().store_batch_retry_recv_timeout.0 / 2,
         }
     }
 }
