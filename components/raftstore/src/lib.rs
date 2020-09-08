@@ -4,6 +4,7 @@
 #![feature(cell_update)]
 #![feature(shrink_to)]
 #![feature(div_duration)]
+#![feature(thread_id_value)]
 
 #[macro_use]
 extern crate bitflags;
