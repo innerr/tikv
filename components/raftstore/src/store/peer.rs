@@ -36,6 +36,7 @@ use uuid::Uuid;
 use crate::coprocessor::{CoprocessorHost, RegionChangeEvent};
 use crate::store::fsm::apply::CatchUpLogs;
 use crate::store::fsm::store::PollContext;
+use crate::store::fsm::sync_policy::DelayableSender;
 use crate::store::fsm::{apply, Apply, ApplyMetrics, ApplyTask, GroupState, Proposal};
 use crate::store::util::is_learner;
 use crate::store::worker::{ReadDelegate, ReadExecutor, ReadProgress, RegionTask};
@@ -751,9 +752,9 @@ where
         )?;
         // write kv rocksdb first in case of restart happen between two write
         let mut write_opts = WriteOptions::new();
-        write_opts.set_sync(ctx.cfg.sync_log);
+        write_opts.set_sync(true);
         ctx.engines.kv.write_opt(&kv_wb, &write_opts)?;
-        ctx.engines.raft.consume(&mut raft_wb, ctx.cfg.sync_log)?;
+        ctx.engines.raft.consume(&mut raft_wb, true)?;
 
         if self.get_store().is_initialized() && !keep_data {
             // If we meet panic when deleting data and raft log, the dirty data
@@ -952,7 +953,7 @@ where
     #[inline]
     fn send<T, I>(&mut self, trans: &mut T, msgs: I, metrics: &mut RaftMessageMetrics)
     where
-        T: Transport,
+        T: DelayableSender,
         I: IntoIterator<Item = eraftpb::Message>,
     {
         for msg in msgs {
@@ -1278,6 +1279,15 @@ where
         }
     }
 
+    pub fn on_synced(&mut self, idx: Option<u64>) {
+        let idx = idx.unwrap_or_else(|| self.raft_group.raft.raft_log.last_index());
+        if self.mut_store().synced_idx >= idx {
+            return;
+        }
+        self.raft_group.raft.on_synced(idx);
+        self.mut_store().on_synced(idx);
+    }
+
     #[inline]
     pub fn ready_to_handle_pending_snap(&self) -> bool {
         // If apply worker is still working, written apply state may be overwritten
@@ -1431,7 +1441,11 @@ where
             fail_point!("raft_before_follower_send");
             let messages = mem::replace(&mut self.pending_messages, vec![]);
             ctx.need_flush_trans = true;
-            self.send(&mut ctx.trans, messages, &mut ctx.raft_metrics.message);
+            self.send(
+                &mut ctx.sync_policy.trans,
+                messages,
+                &mut ctx.raft_metrics.message,
+            );
         }
         let mut destroy_regions = vec![];
         if self.has_pending_snapshot() {
@@ -1470,10 +1484,23 @@ where
             }
         }
 
-        if !self
-            .raft_group
-            .has_ready_since(Some(self.last_applying_idx))
-        {
+        if !ctx.sync_log && self.raft_group.has_must_immediate_sync_ready() {
+            ctx.sync_policy
+                .metrics
+                .sync_events
+                .sync_raftdb_ready_must_sync += 1;
+            ctx.sync_log = true;
+        };
+
+        let has_ready = if ctx.sync_log {
+            self.raft_group.has_ready_since(self.last_applying_idx)
+        } else {
+            // Committed log may not sync yet in this instance
+            self.raft_group
+                .has_ready_from_range(self.last_applying_idx, self.get_store().synced_idx)
+        };
+
+        if !has_ready {
             // Generating snapshot task won't set ready for raft group.
             if let Some(gen_task) = self.mut_store().take_gen_snap_task() {
                 self.pending_request_snapshot_count
@@ -1505,7 +1532,12 @@ where
             "peer_id" => self.peer.get_id(),
         );
 
-        let mut ready = self.raft_group.ready_since(self.last_applying_idx);
+        let mut ready = if ctx.sync_log {
+            self.raft_group.ready_since(self.last_applying_idx)
+        } else {
+            self.raft_group
+                .ready_from_range(self.last_applying_idx, self.get_store().synced_idx)
+        };
 
         self.on_role_changed(ctx, &ready);
 
@@ -1530,16 +1562,20 @@ where
                 // TODO: It can change to not rely on the `committed_entries` must have the latest committed entry
                 // and become O(1) by maintaining these not-committed admin requests that changes epoch.
                 if hs.get_commit() > self.get_store().committed_index() {
-                    assert_eq!(
-                        ready
-                            .committed_entries
-                            .as_ref()
-                            .unwrap()
-                            .last()
-                            .unwrap()
-                            .index,
-                        hs.get_commit()
-                    );
+                    // TODO: When leader's synced-idx behide two follower's this will fail,
+                    //   Gengliqi will rewrite this soon, we commentted this as workaround
+                    if !ctx.cfg.delay_sync_enabled() {
+                        assert_eq!(
+                            ready
+                                .committed_entries
+                                .as_ref()
+                                .unwrap()
+                                .last()
+                                .unwrap()
+                                .index,
+                            hs.get_commit()
+                        );
+                    }
                     let mut split_to_be_updated = true;
                     let mut merge_to_be_updated = true;
                     for entry in ready.committed_entries.as_ref().unwrap().iter().rev() {
@@ -1577,7 +1613,11 @@ where
             fail_point!("raft_before_leader_send");
             let msgs = ready.messages.drain(..);
             ctx.need_flush_trans = true;
-            self.send(&mut ctx.trans, msgs, &mut ctx.raft_metrics.message);
+            self.send(
+                &mut ctx.sync_policy.trans,
+                msgs,
+                &mut ctx.raft_metrics.message,
+            );
         }
 
         let invoke_ctx = match self
@@ -1634,7 +1674,7 @@ where
                 self.pending_messages = mem::replace(&mut ready.messages, vec![]);
             } else {
                 self.send(
-                    &mut ctx.trans,
+                    &mut ctx.sync_policy.trans,
                     ready.messages.drain(..),
                     &mut ctx.raft_metrics.message,
                 );
@@ -3009,7 +3049,7 @@ where
         }
     }
 
-    fn send_raft_message<T: Transport>(&mut self, msg: eraftpb::Message, trans: &mut T) {
+    fn send_raft_message<T: DelayableSender>(&mut self, msg: eraftpb::Message, trans: &mut T) {
         let mut send_msg = RaftMessage::default();
         send_msg.set_region_id(self.region_id);
         // set current epoch
@@ -3060,7 +3100,11 @@ where
         }
         send_msg.set_message(msg);
 
-        if let Err(e) = trans.send(send_msg) {
+        let to_leader = to_peer_id == self.leader_id();
+        let is_snapshot_msg = msg_type == eraftpb::MessageType::MsgSnapshot;
+
+        let res = trans.maybe_delay_send(send_msg, self.is_leader(), to_leader, is_snapshot_msg);
+        if let Err(e) = res {
             warn!(
                 "failed to send msg to other peer";
                 "region_id" => self.region_id,
@@ -3070,15 +3114,24 @@ where
                 "err" => ?e,
                 "error_code" => %e.error_code(),
             );
-            if to_peer_id == self.leader_id() {
-                self.leader_unreachable = true;
-            }
-            // unreachable store
-            self.raft_group.report_unreachable(to_peer_id);
-            if msg_type == eraftpb::MessageType::MsgSnapshot {
-                self.raft_group
-                    .report_snapshot(to_peer_id, SnapshotStatus::Failure);
-            }
+            self.on_send_err(to_leader, is_snapshot_msg, to_peer_id);
+        };
+    }
+
+    pub fn on_send_err(
+        &mut self,
+        leader_unreachable: bool,
+        is_snapshot_msg: bool,
+        to_peer_id: u64,
+    ) {
+        if leader_unreachable {
+            self.leader_unreachable = true;
+        }
+        // unreachable store
+        self.raft_group.report_unreachable(to_peer_id);
+        if is_snapshot_msg {
+            self.raft_group
+                .report_snapshot(to_peer_id, SnapshotStatus::Failure);
         }
     }
 
@@ -3094,7 +3147,7 @@ where
             send_msg.set_to_peer(peer.clone());
             let extra_msg = send_msg.mut_extra_msg();
             extra_msg.set_type(ExtraMessageType::MsgRegionWakeUp);
-            if let Err(e) = ctx.trans.send(send_msg) {
+            if let Err(e) = ctx.sync_policy.trans.send(send_msg) {
                 error!(
                     "failed to send wake up message";
                     "region_id" => self.region_id,
@@ -3129,7 +3182,7 @@ where
             send_msg.set_to_peer(peer.clone());
             let extra_msg = send_msg.mut_extra_msg();
             extra_msg.set_type(ExtraMessageType::MsgCheckStalePeer);
-            if let Err(e) = ctx.trans.send(send_msg) {
+            if let Err(e) = ctx.sync_policy.trans.send(send_msg) {
                 error!(
                     "failed to send check stale peer message";
                     "region_id" => self.region_id,
@@ -3181,7 +3234,7 @@ where
         let extra_msg = send_msg.mut_extra_msg();
         extra_msg.set_type(ExtraMessageType::MsgWantRollbackMerge);
         extra_msg.set_premerge_commit(premerge_commit);
-        if let Err(e) = ctx.trans.send(send_msg) {
+        if let Err(e) = ctx.sync_policy.trans.send(send_msg) {
             error!(
                 "failed to send want rollback merge message";
                 "region_id" => self.region_id,

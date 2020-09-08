@@ -21,6 +21,7 @@ use raft::eraftpb::{ConfState, Entry, HardState, Snapshot};
 use raft::{self, Error as RaftError, RaftState, Ready, Storage, StorageError};
 
 use crate::store::fsm::GenSnapTask;
+use crate::store::local_metrics::SyncEventMetrics;
 use crate::store::util;
 use crate::store::ProposalContext;
 use crate::{Error, Result};
@@ -316,6 +317,7 @@ where
     fn raft_wb_mut(&mut self) -> &mut WR;
     fn sync_log(&self) -> bool;
     fn set_sync_log(&mut self, sync: bool);
+    fn metrics_mut(&mut self) -> &mut SyncEventMetrics;
 }
 
 fn storage_error<E>(error: E) -> raft::Error
@@ -604,6 +606,8 @@ where
     cache: Option<EntryCache>,
 
     pub tag: String,
+
+    pub synced_idx: u64,
 }
 
 impl<EK, ER> Storage for PeerStorage<EK, ER>
@@ -666,6 +670,7 @@ where
         }
         let last_term = init_last_term(&engines, region, &raft_state, &apply_state)?;
         let applied_index_term = init_applied_index_term(&engines, region, &apply_state)?;
+        let applied_index = apply_state.applied_index;
 
         let cache = if engines.raft.has_builtin_entry_cache() {
             None
@@ -687,6 +692,7 @@ where
             applied_index_term,
             last_term,
             cache,
+            synced_idx: applied_index,
         })
     }
 
@@ -711,6 +717,10 @@ where
             hard_state,
             util::conf_state_from_region(self.region()),
         ))
+    }
+
+    pub fn on_synced(&mut self, idx: u64) {
+        self.synced_idx = idx;
     }
 
     fn check_range(&self, low: u64, high: u64) -> raft::Result<()> {
@@ -909,6 +919,12 @@ where
     /// Gets a snapshot. Returns `SnapshotTemporarilyUnavailable` if there is no unavailable
     /// snapshot.
     pub fn snapshot(&self, request_index: u64) -> raft::Result<Snapshot> {
+        if self.synced_idx < request_index {
+            return Err(raft::Error::Store(
+                raft::StorageError::SnapshotTemporarilyUnavailable,
+            ));
+        }
+
         let mut snap_state = self.snap_state.borrow_mut();
         let mut tried_cnt = self.snap_tried_cnt.borrow_mut();
 
@@ -969,7 +985,11 @@ where
         let (tx, rx) = mpsc::sync_channel(1);
         *snap_state = SnapState::Generating(rx);
 
-        let task = GenSnapTask::new(self.region.get_id(), self.committed_index(), tx);
+        let task = GenSnapTask::new(
+            self.region.get_id(),
+            cmp::min(self.committed_index(), self.synced_idx),
+            tx,
+        );
         let mut gen_snap_task = self.gen_snap_task.borrow_mut();
         assert!(gen_snap_task.is_none());
         *gen_snap_task = Some(task);
@@ -985,7 +1005,7 @@ where
     // Append the given entries to the raft log using previous last index or self.last_index.
     // Return the new last index for later update. After we commit in engine, we can set last_index
     // to the return one.
-    pub fn append<H: HandleRaftReadyContext<EK::WriteBatch, ER::LogBatch>>(
+    fn append<H: HandleRaftReadyContext<EK::WriteBatch, ER::LogBatch>>(
         &mut self,
         invoke_ctx: &mut InvokeContext,
         entries: &[Entry],
@@ -1009,8 +1029,8 @@ where
         };
 
         for entry in entries {
-            if !ready_ctx.sync_log() {
-                ready_ctx.set_sync_log(get_sync_log_from_entry(entry));
+            if !ready_ctx.sync_log() && get_sync_log_from_entry(entry, ready_ctx.metrics_mut()) {
+                ready_ctx.set_sync_log(true);
             }
         }
 
@@ -1356,6 +1376,13 @@ where
         let snapshot_index = if ready.snapshot().is_empty() {
             0
         } else {
+            if !ready_ctx.sync_log() {
+                ready_ctx
+                    .metrics_mut()
+                    .sync_events
+                    .sync_raftdb_meet_snapshot += 1;
+                ready_ctx.set_sync_log(true);
+            }
             fail_point!("raft_before_apply_snap");
             let (kv_wb, raft_wb) = ready_ctx.wb_mut();
             self.apply_snapshot(&mut ctx, ready.snapshot(), kv_wb, raft_wb, &destroy_regions)?;
@@ -1366,7 +1393,11 @@ where
             last_index(&ctx.raft_state)
         };
 
-        if ready.must_sync() {
+        if !ready_ctx.sync_log() && ready.must_sync() {
+            ready_ctx
+                .metrics_mut()
+                .sync_events
+                .sync_raftdb_ready_must_sync += 1;
             ready_ctx.set_sync_log(true);
         }
 
@@ -1460,8 +1491,9 @@ where
     }
 }
 
-fn get_sync_log_from_entry(entry: &Entry) -> bool {
+fn get_sync_log_from_entry(entry: &Entry, metrics: &mut SyncEventMetrics) -> bool {
     if entry.get_sync_log() {
+        metrics.sync_events.sync_raftdb_storage_entry_require += 1;
         return true;
     }
 
@@ -1469,6 +1501,7 @@ fn get_sync_log_from_entry(entry: &Entry) -> bool {
     if !ctx.is_empty() {
         let ctx = ProposalContext::from_bytes(ctx);
         if ctx.contains(ProposalContext::SYNC_LOG) {
+            metrics.sync_events.sync_raftdb_storage_entry_ctx_require += 1;
             return true;
         }
     }
@@ -1683,6 +1716,7 @@ mod tests {
         kv_wb: RocksWriteBatch,
         raft_wb: RocksWriteBatch,
         sync_log: bool,
+        metrics: SyncEventMetrics,
     }
 
     impl ReadyContext {
@@ -1691,6 +1725,7 @@ mod tests {
                 kv_wb: s.engines.kv.write_batch(),
                 raft_wb: s.engines.raft.write_batch(),
                 sync_log: false,
+                metrics: SyncEventMetrics::default(),
             }
         }
     }
@@ -1710,6 +1745,9 @@ mod tests {
         }
         fn set_sync_log(&mut self, sync: bool) {
             self.sync_log = sync;
+        }
+        fn metrics_mut(&mut self) -> &mut SyncEventMetrics {
+            &mut self.metrics
         }
     }
 
@@ -2465,6 +2503,7 @@ mod tests {
     #[test]
     fn test_sync_log() {
         let mut tbl = vec![];
+        let mut metrics = SyncEventMetrics::default();
 
         // Do not sync empty entrise.
         tbl.push((Entry::default(), false));
@@ -2485,7 +2524,7 @@ mod tests {
         tbl.push((e, true));
 
         for (e, sync) in tbl {
-            assert_eq!(get_sync_log_from_entry(&e), sync, "{:?}", e);
+            assert_eq!(get_sync_log_from_entry(&e, &mut metrics), sync, "{:?}", e);
         }
     }
 

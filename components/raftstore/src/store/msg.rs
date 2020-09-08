@@ -364,7 +364,9 @@ pub enum PeerMsg<EK: KvEngine> {
     /// that the raft node will not work anymore.
     Tick(PeerTicks),
     /// Result of applying committed entries. The message can't be lost.
-    ApplyRes { res: ApplyTaskRes<EK::Snapshot> },
+    ApplyRes {
+        res: ApplyTaskRes<EK::Snapshot>,
+    },
     /// Message that can't be lost but rarely created. If they are lost, real bad
     /// things happen like some peers will be considered dead in the group.
     SignificantMsg(SignificantMsg<EK::Snapshot>),
@@ -378,6 +380,15 @@ pub enum PeerMsg<EK: KvEngine> {
     HeartbeatPd,
     /// Asks region to change replication mode.
     UpdateReplicationMode,
+    Synced(u64),
+    AsyncSendMsgFailed(PeerMsgTrivialInfo),
+}
+
+pub struct PeerMsgTrivialInfo {
+    pub create_ts: i64,
+    pub to_peer_id: u64,
+    pub to_leader: bool,
+    pub is_snapshot_msg: bool,
 }
 
 impl<EK: KvEngine> fmt::Debug for PeerMsg<EK> {
@@ -397,6 +408,12 @@ impl<EK: KvEngine> fmt::Debug for PeerMsg<EK> {
             PeerMsg::CasualMessage(msg) => write!(fmt, "CasualMessage {:?}", msg),
             PeerMsg::HeartbeatPd => write!(fmt, "HeartbeatPd"),
             PeerMsg::UpdateReplicationMode => write!(fmt, "UpdateReplicationMode"),
+            PeerMsg::Synced(idx) => write!(fmt, "Synced {:?}", idx),
+            PeerMsg::AsyncSendMsgFailed(info) => write!(
+                fmt,
+                "ToPeer {:?}, ToLeader {:?}, IsSnapshotMsg {:?}",
+                info.to_peer_id, info.to_leader, info.is_snapshot_msg,
+            ),
         }
     }
 }

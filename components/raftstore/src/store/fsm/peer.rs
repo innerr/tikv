@@ -476,10 +476,21 @@ where
                 }
                 PeerMsg::Noop => {}
                 PeerMsg::UpdateReplicationMode => self.on_update_replication_mode(),
+                PeerMsg::Synced(idx) => {
+                    self.fsm.peer.on_synced(Some(idx));
+                    self.fsm.has_ready = true;
+                }
+                PeerMsg::AsyncSendMsgFailed(info) => {
+                    self.fsm
+                        .peer
+                        .on_send_err(info.to_leader, info.is_snapshot_msg, info.to_peer_id)
+                }
             }
         }
         // Propose batch request which may be still waiting for more raft-command
         self.propose_batch_raft_command();
+
+        self.ctx.sync_policy.post_peer_msgs_handled(&mut self.fsm);
     }
 
     fn propose_batch_raft_command(&mut self) {
@@ -858,12 +869,12 @@ where
     #[inline]
     pub fn handle_raft_ready_apply(&mut self, ready: &mut Ready, invoke_ctx: &InvokeContext) {
         self.fsm.early_apply = ready
-            .committed_entries
-            .as_ref()
-            .and_then(|e| e.last())
-            .map_or(false, |e| {
-                self.fsm.peer.can_early_apply(e.get_term(), e.get_index())
-            });
+                .committed_entries
+                .as_ref()
+                .and_then(|e| e.last())
+                .map_or(false, |e| {
+                    self.fsm.peer.can_early_apply(e.get_term(), e.get_index())
+                });
         if !self.fsm.early_apply {
             return;
         }
@@ -1803,6 +1814,12 @@ where
             // data too.
             panic!("{} destroy err {:?}", self.fsm.peer.tag, e);
         }
+        self.ctx
+            .sync_policy
+            .metrics
+            .sync_events
+            .on_peer_destroy_sync();
+
         // Some places use `force_send().unwrap()` if the StoreMeta lock is held.
         // So in here, it's necessary to held the StoreMeta lock when closing the router.
         self.ctx.router.close(region_id);
