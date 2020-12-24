@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicI64, AtomicU64};
 use std::sync::Arc;
+use std::mem;
 
 use crossbeam::utils::CachePadded;
 use engine_traits::KvEngine;
@@ -65,10 +66,10 @@ impl<EK: KvEngine, ER: RaftEngine> Action for SyncAction<EK, ER> {
 
 #[derive(Default)]
 pub struct UnsyncedReady {
-    number: u64,
-    region_id: u64,
-    notifier: Arc<AtomicU64>,
-    version: u64,
+    pub number: u64,
+    pub region_id: u64,
+    pub notifier: Arc<AtomicU64>,
+    pub version: u64,
 }
 
 impl UnsyncedReady {
@@ -228,11 +229,15 @@ impl<A: Action> SyncPolicy<A> {
         notifier: Arc<AtomicU64>,
         version: u64,
     ) {
-        if !self.delay_sync_enabled {
-            return;
-        }
+        //if !self.delay_sync_enabled {
+        //    return;
+        //}
         self.unsynced_readies
             .push_back(UnsyncedReady::new(number, region_id, notifier, version));
+    }
+
+    pub fn detach_unsynced_readies(&mut self) -> VecDeque<UnsyncedReady> {
+        mem::take(&mut self.unsynced_readies)
     }
 
     /// Update the global timestamps(last_sync_ts, last_plan_ts).
