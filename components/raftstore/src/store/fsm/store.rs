@@ -95,7 +95,7 @@ where
     tag: String,
     wbs: Arc<Mutex<VecDeque<ER::LogBatch>>>,
     pub tx: LooseBoundedSender<(ER::LogBatch, VecDeque<UnsyncedReady>)>,
-    rx: Arc<Receiver<(ER::LogBatch, VecDeque<UnsyncedReady>)>>,
+    rx: Arc<Mutex<Receiver<(ER::LogBatch, VecDeque<UnsyncedReady>)>>>,
     workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
@@ -130,7 +130,7 @@ where
             tag,
             wbs: Arc::new(Mutex::new(VecDeque::default())),
             tx,
-            rx: Arc::new(rx),
+            rx: Arc::new(Mutex::new(rx)),
             workers: Arc::new(Mutex::new(vec![])),
         };
         async_writer.spawn(pool_size);
@@ -138,15 +138,15 @@ where
     }
 
     fn spawn(&mut self, pool_size: usize) {
-        // TODO: support more than 1 write-thread
-        assert!(pool_size == 1);
         for i in 0..pool_size {
             let mut x = self.clone();
             let t = thread::Builder::new()
                 .name(thd_name!(format!("raftdb-async-writer-{}", i)))
                 .spawn(move || {
-                    let (wb, unsynced_readies) = x.rx.recv().unwrap();
-                    x.sync_write(wb, unsynced_readies)
+                    loop {
+                        let (wb, unsynced_readies) = x.rx.lock().unwrap().recv().unwrap();
+                        x.sync_write(wb, unsynced_readies);
+                    }
                 })
                 .unwrap();
             // TODO: graceful exit
@@ -1356,7 +1356,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             cfg.value().delay_sync_us as i64,
         );
         let async_writer = Arc::new(Mutex::new(AsyncDBWriter::new(engines.raft.clone(),
-            self.router.clone(), "raftstore-async-writer".to_string(), 1)));
+            self.router.clone(), "raftstore-async-writer".to_string(), cfg.value().store_io_pool_size as usize)));
         let mut builder = RaftPollerBuilder {
             cfg,
             store: meta,
