@@ -803,7 +803,11 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
         fail_point!("raft_after_save");
 
         if ready_cnt != 0 {
-            let unsynced_version = Some(self.poll_ctx.sync_policy.new_unsynced_version());
+            let unsynced_version = if !raft_wb_is_empty {
+                Some(self.poll_ctx.sync_policy.new_unsynced_version())
+            } else {
+                None
+            };
             let mut batch_pos = 0;
             let mut ready_res = mem::take(&mut self.poll_ctx.ready_res);
             for (ready, invoke_ctx) in ready_res.drain(..) {
@@ -823,7 +827,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
             let raft_wb = self.poll_ctx.detach_raft_wb();
             let unsynced_readies = self.poll_ctx.sync_policy.detach_unsynced_readies();
             let mut async_writer = self.poll_ctx.async_writer.lock().unwrap();
-            async_writer.sync_write(raft_wb, unsynced_readies);
+            async_writer.async_write(raft_wb, unsynced_readies);
         }
 
         let dur = self.timer.elapsed();
