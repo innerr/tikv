@@ -84,6 +84,7 @@ const UNREACHABLE_BACKOFF: Duration = Duration::from_secs(10);
 
 use std::collections::VecDeque;
 use std::thread::JoinHandle;
+use prometheus::IntGauge;
 use chan;
 
 pub struct AsyncDBWriter<EK, ER>
@@ -98,6 +99,7 @@ where
     pub tx: chan::Sender<(ER::LogBatch, VecDeque<UnsyncedReady>)>,
     rx: Arc<chan::Receiver<(ER::LogBatch, VecDeque<UnsyncedReady>)>>,
     workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    metrics_queue_size: IntGauge,
 }
 
 impl<EK, ER> Clone for AsyncDBWriter<EK, ER>
@@ -114,6 +116,7 @@ where
             tx: self.tx.clone(),
             rx: self.rx.clone(),
             workers: self.workers.clone(),
+            metrics_queue_size: self.metrics_queue_size.clone(),
         }
     }
 }
@@ -133,6 +136,8 @@ where
             tx,
             rx: Arc::new(rx),
             workers: Arc::new(Mutex::new(vec![])),
+            metrics_queue_size: ASYNC_WRITER_IO_QUEUE_VEC
+                .with_label_values(&["raft-log"]),
         };
         async_writer.spawn(pool_size);
         async_writer
@@ -145,8 +150,11 @@ where
                 .name(thd_name!(format!("raftdb-async-writer-{}", i)))
                 .spawn(move || {
                     loop {
+                        let now = TiInstant::now_coarse();
                         let (wb, unsynced_readies) = x.rx.recv().unwrap();
                         x.sync_write(wb, unsynced_readies);
+                        STORE_WRITE_RAFTDB_TICK_DURATION_HISTOGRAM
+                            .observe(duration_to_sec(now.elapsed()) as f64);
                     }
                 })
                 .unwrap();
@@ -165,15 +173,19 @@ where
     }
 
     pub fn async_write(&mut self, wb: ER::LogBatch, unsynced_readies: VecDeque<UnsyncedReady>) {
+        self.metrics_queue_size.inc();
         self.tx.send((wb, unsynced_readies));
     }
 
     pub fn sync_write(&mut self, mut wb: ER::LogBatch, unsynced_readies: VecDeque<UnsyncedReady>) {
+        let now = TiInstant::now_coarse();
         self.engine
             .consume_and_shrink(&mut wb, true, RAFT_WB_SHRINK_SIZE, 4 * 1024)
             .unwrap_or_else(|e| {
                 panic!("{} failed to save raft append result: {:?}", self.tag, e);
             });
+        STORE_WRITE_RAFTDB_DURATION_HISTOGRAM.observe(duration_to_sec(now.elapsed()) as f64);
+        self.metrics_queue_size.dec();
         self.flush_unsynced_readies(unsynced_readies);
         let mut wbs = self.wbs.lock().unwrap();
         wbs.push_back(wb);
@@ -750,6 +762,7 @@ pub struct RaftPoller<EK: KvEngine + 'static, ER: RaftEngine + 'static, T: 'stat
     peer_msg_buf: Vec<PeerMsg<EK>>,
     previous_metrics: RaftMetrics,
     timer: TiInstant,
+    loop_timer: TiInstant,
     poll_ctx: PollContext<EK, ER, T>,
     messages_per_tick: usize,
     cfg_tracker: Tracker<Config>,
@@ -768,6 +781,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
         let ready_cnt = self.poll_ctx.ready_res.len();
         self.poll_ctx.raft_metrics.ready.has_ready_region += ready_cnt as u64;
         fail_point!("raft_before_save");
+        let now = TiInstant::now_coarse();
         if !self.poll_ctx.kv_wb.is_empty() {
             let mut write_opts = WriteOptions::new();
             write_opts.set_sync(true);
@@ -786,6 +800,8 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
             }
         }
         fail_point!("raft_between_save");
+        STORE_WRITE_KVDB_DURATION_HISTOGRAM
+            .observe(duration_to_sec(now.elapsed()) as f64);
 
         let raft_wb_is_empty = self.poll_ctx.raft_wb.is_empty();
         if !raft_wb_is_empty {
@@ -889,6 +905,9 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
         self.poll_ctx.sync_log = false;
         self.poll_ctx.has_ready = false;
         self.timer = TiInstant::now_coarse();
+        STORE_LOOP_DURATION_HISTOGRAM
+            .observe(duration_to_sec(self.loop_timer.elapsed()) as f64);
+        self.loop_timer = TiInstant::now_coarse();
         // update config
         self.poll_ctx.perf_context_statistics.start();
         if let Some(incoming) = self.cfg_tracker.any_new() {
@@ -987,6 +1006,8 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
             .raft_metrics
             .process_ready
             .observe(duration_to_sec(self.timer.elapsed()) as f64);
+        STORE_LOOP_WORK_DURATION_HISTOGRAM
+            .observe(duration_to_sec(self.loop_timer.elapsed()) as f64);
         self.poll_ctx.raft_metrics.flush();
         self.poll_ctx.store_stat.flush();
     }
@@ -1245,6 +1266,7 @@ where
             peer_msg_buf: Vec::with_capacity(ctx.cfg.messages_per_tick),
             previous_metrics: ctx.raft_metrics.clone(),
             timer: TiInstant::now_coarse(),
+            loop_timer: TiInstant::now_coarse(),
             messages_per_tick: ctx.cfg.messages_per_tick,
             poll_ctx: ctx,
             cfg_tracker: self.cfg.clone().tracker(tag),
