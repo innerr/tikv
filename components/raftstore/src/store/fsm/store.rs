@@ -1379,7 +1379,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
         );
         let async_writer = Arc::new(Mutex::new(AsyncDBWriter::new(engines.raft.clone(),
             self.router.clone(), "raftstore-async-writer".to_string(),
-            cfg.value().store_io_pool_size as usize, 16)));
+            cfg.value().store_io_pool_size as usize, cfg.value().store_io_queue as usize)));
         let mut builder = RaftPollerBuilder {
             cfg,
             store: meta,

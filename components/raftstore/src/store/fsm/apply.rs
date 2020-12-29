@@ -353,6 +353,8 @@ where
 
     yield_duration: Duration,
 
+    apply_io_size: usize,
+
     store_id: u64,
     /// region_id -> (peer_id, is_splitting)
     /// Used for handling race between splitting and creating new peer.
@@ -402,6 +404,7 @@ where
             use_delete_range: cfg.use_delete_range,
             perf_context_statistics: PerfContextStatistics::new(cfg.perf_level),
             yield_duration: cfg.apply_yield_duration.0,
+            apply_io_size: cfg.apply_io_size as usize,
             store_id,
             pending_create_peers,
         }
@@ -922,7 +925,7 @@ where
         if !data.is_empty() {
             let cmd = util::parse_data_at(data, index, &self.tag);
 
-            if should_write_to_engine(&cmd) || apply_ctx.kv_wb().should_write_to_engine() {
+            if should_write_to_engine(&cmd) || apply_ctx.kv_wb().data_size() >= apply_ctx.apply_io_size {
                 apply_ctx.commit(self);
                 if let Some(start) = self.handle_start.as_ref() {
                     if start.elapsed() >= apply_ctx.yield_duration {

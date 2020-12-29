@@ -32,6 +32,10 @@ pub struct Config {
     pub delay_sync_us: u64,
     #[config(skip)]
     pub store_io_pool_size: u64,
+    #[config(skip)]
+    pub store_io_queue: u64,
+    #[config(skip)]
+    pub apply_io_size: u64,
     // minimizes disruption when a partitioned node rejoins the cluster by using a two phase election.
     #[config(skip)]
     pub prevote: bool,
@@ -199,6 +203,8 @@ impl Default for Config {
         Config {
             delay_sync_us: 0,
             store_io_pool_size: 2,
+            store_io_queue: 1,
+            apply_io_size: 1024 * 32,
             prevote: true,
             raftdb_path: String::new(),
             capacity: ReadableSize(0),
@@ -427,6 +433,12 @@ impl Config {
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["store_io_pool_size"])
             .set((self.store_io_pool_size as i32).into());
+        CONFIG_RAFTSTORE_GAUGE
+            .with_label_values(&["store_io_queue"])
+            .set((self.store_io_queue as i32).into());
+        CONFIG_RAFTSTORE_GAUGE
+            .with_label_values(&["apply_io_size"])
+            .set((self.apply_io_size as i32).into());
 
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["prevote"])
