@@ -84,10 +84,18 @@ const UNREACHABLE_BACKOFF: Duration = Duration::from_secs(10);
 
 use std::collections::VecDeque;
 use std::thread::JoinHandle;
-use prometheus::IntGauge;
-use chan;
+//use chan;
+use std::sync::Condvar;
 
-pub struct AsyncDBWriter<EK, ER>
+pub struct AsyncWriterTask<ER>
+where
+    ER: RaftEngine,
+{
+    pub wb: ER::LogBatch,
+    pub unsynced_readies: VecDeque<UnsyncedReady>,
+}
+
+pub struct AsyncWriter<EK, ER>
 where
     EK: KvEngine,
     ER: RaftEngine,
@@ -95,49 +103,59 @@ where
     engine: ER,
     router: RaftRouter<EK, ER>,
     tag: String,
+    buff_size: usize,
     wbs: Arc<Mutex<VecDeque<ER::LogBatch>>>,
-    pub tx: chan::Sender<(ER::LogBatch, VecDeque<UnsyncedReady>)>,
-    rx: Arc<chan::Receiver<(ER::LogBatch, VecDeque<UnsyncedReady>)>>,
+
+    //pub tx: chan::Sender<(ER::LogBatch, VecDeque<UnsyncedReady>)>,
+    //rx: Arc<chan::Receiver<(ER::LogBatch, VecDeque<UnsyncedReady>)>>,
+    tasks: Arc<Mutex<VecDeque<AsyncWriterTask<ER>>>>,
+    task_in: Arc<Condvar>,
+    task_out: Arc<Condvar>,
+
     workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
-    metrics_queue_size: IntGauge,
 }
 
-impl<EK, ER> Clone for AsyncDBWriter<EK, ER>
+impl<EK, ER> Clone for AsyncWriter<EK, ER>
 where
     EK: KvEngine,
     ER: RaftEngine,
 {
     fn clone(&self) -> Self {
-        AsyncDBWriter{
+        AsyncWriter{
             engine: self.engine.clone(),
             router: self.router.clone(),
             tag: self.tag.clone(),
+            buff_size: self.buff_size,
             wbs: self.wbs.clone(),
-            tx: self.tx.clone(),
-            rx: self.rx.clone(),
+            //tx: self.tx.clone(),
+            //rx: self.rx.clone(),
+            tasks: self.tasks.clone(),
+            task_in: self.task_in.clone(),
+            task_out: self.task_out.clone(),
             workers: self.workers.clone(),
-            metrics_queue_size: self.metrics_queue_size.clone(),
         }
     }
 }
 
-impl<EK, ER> AsyncDBWriter<EK, ER>
+impl<EK, ER> AsyncWriter<EK, ER>
 where
     EK: KvEngine,
     ER: RaftEngine,
 {
-    pub fn new(engine: ER, router: RaftRouter<EK, ER>, tag: String, pool_size: usize, buff_size: usize) -> AsyncDBWriter<EK, ER> {
-        let (tx, rx) = chan::sync(buff_size);
-        let mut async_writer = AsyncDBWriter{
+    pub fn new(engine: ER, router: RaftRouter<EK, ER>, tag: String, pool_size: usize, buff_size: usize) -> AsyncWriter<EK, ER> {
+        //let (tx, rx) = chan::sync(buff_size);
+        let mut async_writer = AsyncWriter{
             engine,
             router,
             tag,
+            buff_size,
             wbs: Arc::new(Mutex::new(VecDeque::default())),
-            tx,
-            rx: Arc::new(rx),
+            //tx,
+            //rx: Arc::new(rx),
+            tasks: Arc::new(Mutex::new(VecDeque::default())),
+            task_in: Arc::new(Condvar::new()),
+            task_out: Arc::new(Condvar::new()),
             workers: Arc::new(Mutex::new(vec![])),
-            metrics_queue_size: ASYNC_WRITER_IO_QUEUE_VEC
-                .with_label_values(&["raft-log"]),
         };
         async_writer.spawn(pool_size);
         async_writer
@@ -151,8 +169,16 @@ where
                 .spawn(move || {
                     loop {
                         let now = TiInstant::now_coarse();
-                        let (wb, unsynced_readies) = x.rx.recv().unwrap();
-                        x.sync_write(wb, unsynced_readies);
+                        let task = {
+                            let mut tasks = x.tasks.lock().unwrap();
+                            while tasks.is_empty() {
+                                tasks = x.task_in.wait(tasks).unwrap();
+                            }
+                            x.task_out.notify_one();
+                            tasks.pop_front().unwrap()
+                        };
+                        //let (wb, unsynced_readies) = x.rx.recv().unwrap();
+                        x.sync_write(task.wb, task.unsynced_readies);
                         STORE_WRITE_RAFTDB_TICK_DURATION_HISTOGRAM
                             .observe(duration_to_sec(now.elapsed()) as f64);
                     }
@@ -173,8 +199,14 @@ where
     }
 
     pub fn async_write(&mut self, wb: ER::LogBatch, unsynced_readies: VecDeque<UnsyncedReady>) {
-        self.metrics_queue_size.inc();
-        self.tx.send((wb, unsynced_readies));
+        let mut tasks = self.tasks.lock().unwrap();
+        while tasks.len() >= self.buff_size {
+            tasks = self.task_out.wait(tasks).unwrap();
+        }
+        RAFT_ASYNC_WRITER_QUEUE_SIZE.observe(tasks.len() as f64);
+        tasks.push_back(AsyncWriterTask{wb, unsynced_readies});
+        self.task_in.notify_one();
+        //self.tx.send((wb, unsynced_readies));
     }
 
     pub fn sync_write(&mut self, mut wb: ER::LogBatch, unsynced_readies: VecDeque<UnsyncedReady>) {
@@ -185,7 +217,6 @@ where
                 panic!("{} failed to save raft append result: {:?}", self.tag, e);
             });
         STORE_WRITE_RAFTDB_DURATION_HISTOGRAM.observe(duration_to_sec(now.elapsed()) as f64);
-        self.metrics_queue_size.dec();
         self.flush_unsynced_readies(unsynced_readies);
         let mut wbs = self.wbs.lock().unwrap();
         wbs.push_back(wb);
@@ -472,7 +503,7 @@ where
     pub tick_batch: Vec<PeerTickBatch>,
     pub node_start_time: Option<TiInstant>,
     pub sync_policy: SyncPolicy<SyncAction<EK, ER>>,
-    pub async_writer: Arc<Mutex<AsyncDBWriter<EK, ER>>>,
+    pub async_writer: Arc<Mutex<AsyncWriter<EK, ER>>>,
 }
 
 impl<EK, ER, T> HandleRaftReadyContext<EK::WriteBatch, ER::LogBatch> for PollContext<EK, ER, T>
@@ -1045,7 +1076,7 @@ pub struct RaftPollerBuilder<EK: KvEngine, ER: RaftEngine, T> {
     applying_snap_count: Arc<AtomicUsize>,
     global_replication_state: Arc<Mutex<GlobalReplicationState>>,
     pub sync_policy: SyncPolicy<SyncAction<EK, ER>>,
-    pub async_writer: Arc<Mutex<AsyncDBWriter<EK, ER>>>,
+    pub async_writer: Arc<Mutex<AsyncWriter<EK, ER>>>,
 }
 
 impl<EK: KvEngine, ER: RaftEngine, T> RaftPollerBuilder<EK, ER, T> {
@@ -1377,7 +1408,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             cfg.value().delay_sync_enabled(),
             cfg.value().delay_sync_us as i64,
         );
-        let async_writer = Arc::new(Mutex::new(AsyncDBWriter::new(engines.raft.clone(),
+        let async_writer = Arc::new(Mutex::new(AsyncWriter::new(engines.raft.clone(),
             self.router.clone(), "raftstore-async-writer".to_string(),
             cfg.value().store_io_pool_size as usize, cfg.value().store_io_queue as usize)));
         let mut builder = RaftPollerBuilder {
