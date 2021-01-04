@@ -26,10 +26,15 @@ use crate::{Error, Result};
 use engine_traits::{RaftEngine, RaftLogBatch};
 use into_other::into_other;
 use tikv_util::worker::Scheduler;
+use std::sync::Mutex;
 
 use super::metrics::*;
 use super::worker::RegionTask;
 use super::{SnapEntry, SnapKey, SnapManager, SnapshotStatistics};
+
+use tikv_util::collections::HashMap;
+use crate::store::fsm::sync_policy::UnsyncedReady;
+use std::sync::atomic::AtomicU64;
 
 // When we create a region peer, we should initialize its log term/index > 0,
 // so that we can force the follower peer to sync the snapshot first.
@@ -304,15 +309,24 @@ impl Drop for EntryCache {
     }
 }
 
+pub struct AsyncWriterTask<WR>
+where
+    WR: RaftLogBatch,
+{
+    pub wb: WR,
+    pub unsynced_readies: HashMap<u64, UnsyncedReady>,
+}
+
 pub trait HandleRaftReadyContext<WK, WR>
 where
     WK: Mutable,
     WR: RaftLogBatch,
 {
     /// Returns the mutable references of WriteBatch for both KvDB and RaftDB in one interface.
-    fn wb_mut(&mut self) -> (&mut WK, &mut WR);
+    fn wb_mut(&mut self) -> (&mut WK, Arc<Mutex<VecDeque<AsyncWriterTask<WR>>>>);
     fn kv_wb_mut(&mut self) -> &mut WK;
-    fn raft_wb_mut(&mut self) -> &mut WR;
+    //fn raft_wb_mut(&mut self) -> &mut WR;
+    fn raft_wb_pool(&mut self) -> Arc<Mutex<VecDeque<AsyncWriterTask<WR>>>>;
     fn sync_log(&self) -> bool;
     fn set_sync_log(&mut self, sync: bool);
 }
@@ -1016,6 +1030,8 @@ where
         invoke_ctx: &mut InvokeContext,
         entries: Vec<Entry>,
         ready_ctx: &mut H,
+        ready_number: u64,
+        region_notifier: Arc<AtomicU64>,
     ) -> Result<u64> {
         let region_id = self.get_region_id();
         debug!(
@@ -1043,13 +1059,17 @@ where
             cache.append(&self.tag, &entries);
         }
 
-        ready_ctx.raft_wb_mut().append(region_id, entries)?;
-
-        // Delete any previously appended log entries which never committed.
-        // TODO: Wrap it as an engine::Error.
-        ready_ctx
-            .raft_wb_mut()
-            .cut_logs(region_id, last_index + 1, prev_last_index);
+        {
+            let raft_wb_pool = ready_ctx.raft_wb_pool();
+            let mut raft_wbs = raft_wb_pool.lock().unwrap();
+            let current = raft_wbs.front_mut().unwrap();
+            current.wb.append(region_id, entries)?;
+            current.unsynced_readies.insert(region_id,
+                UnsyncedReady{number: ready_number, region_id, notifier: region_notifier, version: 0});
+            // Delete any previously appended log entries which never committed.
+            // TODO: Wrap it as an engine::Error.
+            current.wb.cut_logs(region_id, last_index + 1, prev_last_index);
+        }
 
         invoke_ctx.raft_state.set_last_index(last_index);
         invoke_ctx.last_term = last_term;
@@ -1365,14 +1385,20 @@ where
         ready_ctx: &mut H,
         ready: &mut Ready,
         destroy_regions: Vec<metapb::Region>,
+        region_notifier: Arc<AtomicU64>,
     ) -> Result<InvokeContext> {
+        let region_id = self.get_region_id();
         let mut ctx = InvokeContext::new(self);
         let snapshot_index = if ready.snapshot().is_empty() {
             0
         } else {
             fail_point!("raft_before_apply_snap");
-            let (kv_wb, raft_wb) = ready_ctx.wb_mut();
-            self.apply_snapshot(&mut ctx, ready.snapshot(), kv_wb, raft_wb, &destroy_regions)?;
+            let (kv_wb, raft_wb_pool) = ready_ctx.wb_mut();
+            let mut raft_wbs = raft_wb_pool.lock().unwrap();
+            let current = raft_wbs.front_mut().unwrap();
+            self.apply_snapshot(&mut ctx, ready.snapshot(), kv_wb, &mut current.wb, &destroy_regions)?;
+            current.unsynced_readies.insert(region_id,
+                UnsyncedReady{number: ready.number(), region_id, notifier: region_notifier.clone(), version: 0});
             fail_point!("raft_after_apply_snap");
 
             ctx.destroyed_regions = destroy_regions;
@@ -1381,7 +1407,7 @@ where
         };
 
         if !ready.entries().is_empty() {
-            self.append(&mut ctx, ready.take_entries(), ready_ctx)?;
+            self.append(&mut ctx, ready.take_entries(), ready_ctx, ready.number(), region_notifier.clone())?;
         }
 
         // Last index is 0 means the peer is created from raft message
@@ -1394,7 +1420,12 @@ where
 
         // Save raft state if it has changed or there is a snapshot.
         if ctx.raft_state != self.raft_state || snapshot_index > 0 {
-            ctx.save_raft_state_to(ready_ctx.raft_wb_mut())?;
+            {
+                let raft_wb_pool = ready_ctx.raft_wb_pool();
+                let mut raft_wbs = raft_wb_pool.lock().unwrap();
+                let current = raft_wbs.front_mut().unwrap();
+                ctx.save_raft_state_to(&mut current.wb)?;
+            }
             if snapshot_index > 0 {
                 // in case of restart happen when we just write region state to Applying,
                 // but not write raft_local_state to raft rocksdb in time.
@@ -1642,7 +1673,7 @@ pub fn write_peer_state<T: Mutable>(
     kv_wb.put_msg_cf(CF_RAFT, &keys::region_state_key(region_id), &region_state)?;
     Ok(())
 }
-
+/*
 #[cfg(test)]
 mod tests {
     use crate::coprocessor::CoprocessorHost;
@@ -1705,14 +1736,14 @@ mod tests {
     }
 
     impl HandleRaftReadyContext<KvTestWriteBatch, RaftTestWriteBatch> for ReadyContext {
-        fn wb_mut(&mut self) -> (&mut KvTestWriteBatch, &mut RaftTestWriteBatch) {
-            (&mut self.kv_wb, &mut self.raft_wb)
-        }
+        //fn wb_mut(&mut self) -> (&mut KvTestWriteBatch, &mut RaftTestWriteBatch) {
+        //    (&mut self.kv_wb, &mut self.raft_wb)
+        //}
         fn kv_wb_mut(&mut self) -> &mut KvTestWriteBatch {
             &mut self.kv_wb
         }
-        fn raft_wb_mut(&mut self) -> &mut RaftTestWriteBatch {
-            &mut self.raft_wb
+        fn raft_wb_pool(&mut self) -> &mut RaftTestWriteBatch {
+            &mut self.raft_wbs
         }
         fn sync_log(&self) -> bool {
             self.sync_log
@@ -2621,3 +2652,5 @@ mod tests {
         assert!(build_storage().is_err());
     }
 }
+
+*/

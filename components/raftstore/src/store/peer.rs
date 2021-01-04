@@ -1685,9 +1685,10 @@ where
             self.handle_raft_committed_entries(ctx, ready.take_committed_entries());
         }
 
+        let notifier = self.persisted_notifier.clone();
         let invoke_ctx = match self
             .mut_store()
-            .handle_raft_ready(ctx, &mut ready, destroy_regions)
+            .handle_raft_ready(ctx, &mut ready, destroy_regions, notifier)
         {
             Ok(r) => r,
             Err(e) => {

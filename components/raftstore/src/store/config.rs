@@ -204,7 +204,7 @@ impl Default for Config {
             delay_sync_us: 0,
             store_io_pool_size: 2,
             store_io_queue: 1,
-            apply_io_size: 1024 * 32,
+            apply_io_size: 0,
             prevote: true,
             raftdb_path: String::new(),
             capacity: ReadableSize(0),

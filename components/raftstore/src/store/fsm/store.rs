@@ -82,12 +82,11 @@ const RAFT_WB_SHRINK_SIZE: usize = 1024 * 1024;
 pub const PENDING_MSG_CAP: usize = 100;
 const UNREACHABLE_BACKOFF: Duration = Duration::from_secs(10);
 
+use crate::store::peer_storage::AsyncWriterTask;
 use std::collections::VecDeque;
 use std::thread::JoinHandle;
-use prometheus::IntGauge;
-use chan;
 
-pub struct AsyncDBWriter<EK, ER>
+pub struct AsyncWriter<EK, ER>
 where
     EK: KvEngine,
     ER: RaftEngine,
@@ -95,49 +94,50 @@ where
     engine: ER,
     router: RaftRouter<EK, ER>,
     tag: String,
-    wbs: Arc<Mutex<VecDeque<ER::LogBatch>>>,
-    pub tx: chan::Sender<(ER::LogBatch, VecDeque<UnsyncedReady>)>,
-    rx: Arc<chan::Receiver<(ER::LogBatch, VecDeque<UnsyncedReady>)>>,
+    buff_size: usize,
+    tasks: Arc<Mutex<VecDeque<AsyncWriterTask<ER::LogBatch>>>>,
     workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
-    metrics_queue_size: IntGauge,
 }
 
-impl<EK, ER> Clone for AsyncDBWriter<EK, ER>
+impl<EK, ER> Clone for AsyncWriter<EK, ER>
 where
     EK: KvEngine,
     ER: RaftEngine,
 {
     fn clone(&self) -> Self {
-        AsyncDBWriter{
+        AsyncWriter{
             engine: self.engine.clone(),
             router: self.router.clone(),
             tag: self.tag.clone(),
-            wbs: self.wbs.clone(),
-            tx: self.tx.clone(),
-            rx: self.rx.clone(),
+            buff_size: self.buff_size,
+            tasks: self.tasks.clone(),
             workers: self.workers.clone(),
-            metrics_queue_size: self.metrics_queue_size.clone(),
         }
     }
 }
 
-impl<EK, ER> AsyncDBWriter<EK, ER>
+impl<EK, ER> AsyncWriter<EK, ER>
 where
     EK: KvEngine,
     ER: RaftEngine,
 {
-    pub fn new(engine: ER, router: RaftRouter<EK, ER>, tag: String, pool_size: usize, buff_size: usize) -> AsyncDBWriter<EK, ER> {
-        let (tx, rx) = chan::sync(buff_size);
-        let mut async_writer = AsyncDBWriter{
+    pub fn new(engine: ER, router: RaftRouter<EK, ER>, tag: String, pool_size: usize, buff_size: usize) -> AsyncWriter<EK, ER> {
+        let mut tasks = VecDeque::default();
+        for _ in 0..(pool_size + 1) {
+            tasks.push_back(
+                AsyncWriterTask {
+                    wb: engine.log_batch(4 * 1024),
+                    unsynced_readies: HashMap::default(),
+                }
+            );
+        }
+        let mut async_writer = AsyncWriter{
             engine,
             router,
             tag,
-            wbs: Arc::new(Mutex::new(VecDeque::default())),
-            tx,
-            rx: Arc::new(rx),
+            buff_size,
+            tasks: Arc::new(Mutex::new(tasks)),
             workers: Arc::new(Mutex::new(vec![])),
-            metrics_queue_size: ASYNC_WRITER_IO_QUEUE_VEC
-                .with_label_values(&["raft-log"]),
         };
         async_writer.spawn(pool_size);
         async_writer
@@ -149,10 +149,32 @@ where
             let t = thread::Builder::new()
                 .name(thd_name!(format!("raftdb-async-writer-{}", i)))
                 .spawn(move || {
+                    let mut sleep = false;
                     loop {
+                        // TODO: block if no data in current raft_wb
+                        if sleep {
+                            let d = Duration::from_millis(1);
+                            thread::sleep(d);
+                        }
+                        sleep = false;
                         let now = TiInstant::now_coarse();
-                        let (wb, unsynced_readies) = x.rx.recv().unwrap();
-                        x.sync_write(wb, unsynced_readies);
+                        // TODO: block if too many data in current raft_wb
+                        let task = {
+                            let mut tasks = x.tasks.lock().unwrap();
+                            if tasks.front().unwrap().unsynced_readies.is_empty() {
+                                sleep = true;
+                                continue;
+                            }
+                            tasks.pop_front().unwrap()
+                        };
+
+                        let wb = x.sync_write(task.wb, task.unsynced_readies);
+
+                        {
+                            let mut tasks = x.tasks.lock().unwrap();
+                            tasks.push_back(AsyncWriterTask{wb, unsynced_readies: HashMap::default()});
+                        }
+
                         STORE_WRITE_RAFTDB_TICK_DURATION_HISTOGRAM
                             .observe(duration_to_sec(now.elapsed()) as f64);
                     }
@@ -163,21 +185,12 @@ where
         }
     }
 
-    pub fn new_wb(&mut self) -> ER::LogBatch {
-        let mut wbs = self.wbs.lock().unwrap();
-        if wbs.is_empty() {
-            self.engine.log_batch(4 * 1024)
-        } else {
-            wbs.pop_front().unwrap()
-        }
+    pub fn raft_wb_pool(&mut self) -> Arc<Mutex<VecDeque<AsyncWriterTask<ER::LogBatch>>>> {
+        self.tasks.clone()
     }
 
-    pub fn async_write(&mut self, wb: ER::LogBatch, unsynced_readies: VecDeque<UnsyncedReady>) {
-        self.metrics_queue_size.inc();
-        self.tx.send((wb, unsynced_readies));
-    }
-
-    pub fn sync_write(&mut self, mut wb: ER::LogBatch, unsynced_readies: VecDeque<UnsyncedReady>) {
+    // TODO: this func is assumed in tasks.locked status
+    pub fn sync_write(&mut self, mut wb: ER::LogBatch, mut unsynced_readies: HashMap<u64, UnsyncedReady>) -> ER::LogBatch {
         let now = TiInstant::now_coarse();
         self.engine
             .consume_and_shrink(&mut wb, true, RAFT_WB_SHRINK_SIZE, 4 * 1024)
@@ -185,31 +198,41 @@ where
                 panic!("{} failed to save raft append result: {:?}", self.tag, e);
             });
         STORE_WRITE_RAFTDB_DURATION_HISTOGRAM.observe(duration_to_sec(now.elapsed()) as f64);
-        self.metrics_queue_size.dec();
-        self.flush_unsynced_readies(unsynced_readies);
-        let mut wbs = self.wbs.lock().unwrap();
-        wbs.push_back(wb);
+        self.flush_unsynced_readies(&unsynced_readies);
+        unsynced_readies.clear();
+        wb
     }
 
-    fn flush_unsynced_readies(&mut self, mut unsynced_readies: VecDeque<UnsyncedReady>) {
+    fn flush_unsynced_readies(&mut self, unsynced_readies: &HashMap<u64, UnsyncedReady>) {
+        for (_, r) in unsynced_readies {
+            self.flush_unsynced_ready(r);
+        }
+    }
+
+    fn drain_flush_unsynced_readies(&mut self, mut unsynced_readies: VecDeque<UnsyncedReady>) {
         for r in unsynced_readies.drain(..) {
-            loop {
-                let pre_number = r.notifier.load(Ordering::Acquire);
-                assert_ne!(pre_number, r.number);
-                if pre_number > r.number {
-                    break;
+            self.flush_unsynced_ready(&r);
+        }
+    }
+
+    fn flush_unsynced_ready(&mut self, r: &UnsyncedReady) {
+        loop {
+            let pre_number = r.notifier.load(Ordering::Acquire);
+            // TODO: reduce duplicated messages
+            //assert_ne!(pre_number, r.number);
+            if pre_number >= r.number {
+                break;
+            }
+            if pre_number == r.notifier.compare_and_swap(pre_number, r.number, Ordering::AcqRel) {
+                if let Err(e) = self.router.force_send(r.region_id, PeerMsg::Noop) {
+                    error!(
+                        "failed to send noop to trigger persisted ready";
+                        "region_id" => r.region_id,
+                        "ready_number" => r.number,
+                        "error" => ?e,
+                    );
                 }
-                if pre_number == r.notifier.compare_and_swap(pre_number, r.number, Ordering::AcqRel) {
-                    if let Err(e) = self.router.force_send(r.region_id, PeerMsg::Noop) {
-                        error!(
-                            "failed to send noop to trigger persisted ready";
-                            "region_id" => r.region_id,
-                            "ready_number" => r.number,
-                            "error" => ?e,
-                        );
-                    }
-                    break;
-                }
+                break;
             }
         }
     }
@@ -462,7 +485,8 @@ where
     pub store_stat: LocalStoreStat,
     pub engines: Engines<EK, ER>,
     pub kv_wb: EK::WriteBatch,
-    pub raft_wb: ER::LogBatch,
+    //pub raft_wb: ER::LogBatch,
+    pub raft_wb_is_empty: bool,
     pub pending_count: usize,
     pub sync_log: bool,
     pub has_ready: bool,
@@ -472,7 +496,7 @@ where
     pub tick_batch: Vec<PeerTickBatch>,
     pub node_start_time: Option<TiInstant>,
     pub sync_policy: SyncPolicy<SyncAction<EK, ER>>,
-    pub async_writer: Arc<Mutex<AsyncDBWriter<EK, ER>>>,
+    pub async_writer: Arc<Mutex<AsyncWriter<EK, ER>>>,
 }
 
 impl<EK, ER, T> HandleRaftReadyContext<EK::WriteBatch, ER::LogBatch> for PollContext<EK, ER, T>
@@ -480,8 +504,10 @@ where
     EK: KvEngine,
     ER: RaftEngine,
 {
-    fn wb_mut(&mut self) -> (&mut EK::WriteBatch, &mut ER::LogBatch) {
-        (&mut self.kv_wb, &mut self.raft_wb)
+    fn wb_mut(&mut self) -> (&mut EK::WriteBatch, Arc::<Mutex<VecDeque<AsyncWriterTask<ER::LogBatch>>>>) {
+        self.raft_wb_is_empty = false;
+        let mut async_writer = self.async_writer.lock().unwrap();
+        (&mut self.kv_wb, async_writer.raft_wb_pool())
     }
 
     #[inline]
@@ -490,8 +516,10 @@ where
     }
 
     #[inline]
-    fn raft_wb_mut(&mut self) -> &mut ER::LogBatch {
-        &mut self.raft_wb
+    fn raft_wb_pool(&mut self) -> Arc<Mutex<VecDeque<AsyncWriterTask<ER::LogBatch>>>> {
+        self.raft_wb_is_empty = false;
+        let mut async_writer = self.async_writer.lock().unwrap();
+        async_writer.raft_wb_pool()
     }
 
     #[inline]
@@ -510,14 +538,6 @@ where
     EK: KvEngine,
     ER: RaftEngine,
 {
-    #[inline]
-    pub fn detach_raft_wb(&mut self) -> ER::LogBatch {
-        let mut async_writer = self.async_writer.lock().unwrap();
-        let mut raft_wb = async_writer.new_wb();
-        mem::swap(&mut self.raft_wb, &mut raft_wb);
-        raft_wb
-    }
-
     #[inline]
     pub fn store_id(&self) -> u64 {
         self.store.get_id()
@@ -774,7 +794,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
         // the id of slow store in tests.
         fail_point!("on_raft_ready", self.poll_ctx.store_id() == 3, |_| {});
         if self.poll_ctx.trans.need_flush()
-            && (!self.poll_ctx.kv_wb.is_empty() || !self.poll_ctx.raft_wb.is_empty())
+            && (!self.poll_ctx.kv_wb.is_empty() || !self.poll_ctx.raft_wb_is_empty)
         {
             self.poll_ctx.trans.flush();
         }
@@ -803,7 +823,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
         STORE_WRITE_KVDB_DURATION_HISTOGRAM
             .observe(duration_to_sec(now.elapsed()) as f64);
 
-        let raft_wb_is_empty = self.poll_ctx.raft_wb.is_empty();
+        let raft_wb_is_empty = self.poll_ctx.raft_wb_is_empty;
         if !raft_wb_is_empty {
             fail_point!(
                 "raft_before_save_on_store_1",
@@ -835,15 +855,22 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
             }
         }
 
-        let unsynced_readies = self.poll_ctx.sync_policy.detach_unsynced_readies();
         if !raft_wb_is_empty {
-            let raft_wb = self.poll_ctx.detach_raft_wb();
+            // Do nothing
+            /* Sync write testing
             let mut async_writer = self.poll_ctx.async_writer.lock().unwrap();
-            async_writer.async_write(raft_wb, unsynced_readies);
+            let raft_wb_pool = async_writer.raft_wb_pool();
+            let mut raft_wbs = raft_wb_pool.lock().unwrap();
+            let task = raft_wbs.pop_front().unwrap();
+            let wb = async_writer.sync_write(task.wb, task.unsynced_readies);
+            raft_wbs.push_back(AsyncWriterTask{wb, unsynced_readies: HashMap::default()});
+            */
         } else {
+            let unsynced_readies = self.poll_ctx.sync_policy.detach_unsynced_readies();
             let mut async_writer = self.poll_ctx.async_writer.lock().unwrap();
-            async_writer.flush_unsynced_readies(unsynced_readies);
+            async_writer.drain_flush_unsynced_readies(unsynced_readies);
         }
+        self.poll_ctx.raft_wb_is_empty = true;
 
         let dur = self.timer.elapsed();
         if !self.poll_ctx.store_stat.is_busy {
@@ -1045,7 +1072,7 @@ pub struct RaftPollerBuilder<EK: KvEngine, ER: RaftEngine, T> {
     applying_snap_count: Arc<AtomicUsize>,
     global_replication_state: Arc<Mutex<GlobalReplicationState>>,
     pub sync_policy: SyncPolicy<SyncAction<EK, ER>>,
-    pub async_writer: Arc<Mutex<AsyncDBWriter<EK, ER>>>,
+    pub async_writer: Arc<Mutex<AsyncWriter<EK, ER>>>,
 }
 
 impl<EK: KvEngine, ER: RaftEngine, T> RaftPollerBuilder<EK, ER, T> {
@@ -1246,7 +1273,8 @@ where
             store_stat: self.global_stat.local(),
             engines: self.engines.clone(),
             kv_wb: self.engines.kv.write_batch(),
-            raft_wb: self.engines.raft.log_batch(4 * 1024),
+            //raft_wb: self.engines.raft.log_batch(4 * 1024),
+            raft_wb_is_empty: true,
             pending_count: 0,
             sync_log: false,
             has_ready: false,
@@ -1377,7 +1405,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             cfg.value().delay_sync_enabled(),
             cfg.value().delay_sync_us as i64,
         );
-        let async_writer = Arc::new(Mutex::new(AsyncDBWriter::new(engines.raft.clone(),
+        let async_writer = Arc::new(Mutex::new(AsyncWriter::new(engines.raft.clone(),
             self.router.clone(), "raftstore-async-writer".to_string(),
             cfg.value().store_io_pool_size as usize, cfg.value().store_io_queue as usize)));
         let mut builder = RaftPollerBuilder {
