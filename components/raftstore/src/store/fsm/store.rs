@@ -94,7 +94,7 @@ where
     engine: ER,
     router: RaftRouter<EK, ER>,
     tag: String,
-    buff_size: usize,
+    io_min_interval: Duration,
     tasks: Arc<Mutex<VecDeque<AsyncWriterTask<ER::LogBatch>>>>,
     workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
@@ -109,7 +109,7 @@ where
             engine: self.engine.clone(),
             router: self.router.clone(),
             tag: self.tag.clone(),
-            buff_size: self.buff_size,
+            io_min_interval: self.io_min_interval.clone(),
             tasks: self.tasks.clone(),
             workers: self.workers.clone(),
         }
@@ -121,7 +121,8 @@ where
     EK: KvEngine,
     ER: RaftEngine,
 {
-    pub fn new(engine: ER, router: RaftRouter<EK, ER>, tag: String, pool_size: usize, buff_size: usize) -> AsyncWriter<EK, ER> {
+    pub fn new(engine: ER, router: RaftRouter<EK, ER>, tag: String,
+        pool_size: usize, io_min_interval_us: u64) -> AsyncWriter<EK, ER> {
         let mut tasks = VecDeque::default();
         for _ in 0..(pool_size + 1) {
             tasks.push_back(
@@ -135,7 +136,7 @@ where
             engine,
             router,
             tag,
-            buff_size,
+            io_min_interval: Duration::from_micros(io_min_interval_us),
             tasks: Arc::new(Mutex::new(tasks)),
             workers: Arc::new(Mutex::new(vec![])),
         };
@@ -149,20 +150,20 @@ where
             let t = thread::Builder::new()
                 .name(thd_name!(format!("raftdb-async-writer-{}", i)))
                 .spawn(move || {
-                    let mut sleep = false;
+                    let mut last_ts = TiInstant::now_coarse();
                     loop {
-                        // TODO: block if no data in current raft_wb
-                        if sleep {
-                            let d = Duration::from_millis(1);
-                            thread::sleep(d);
+                        let mut now_ts = TiInstant::now_coarse();
+                        let delta = (now_ts - last_ts).saturating_sub(x.io_min_interval);
+                        if !delta.is_zero() {
+                            thread::sleep(delta);
+                            now_ts = TiInstant::now_coarse();
                         }
-                        sleep = false;
-                        let now = TiInstant::now_coarse();
+                        last_ts = now_ts;
+
                         // TODO: block if too many data in current raft_wb
                         let task = {
                             let mut tasks = x.tasks.lock().unwrap();
                             if tasks.front().unwrap().unsynced_readies.is_empty() {
-                                sleep = true;
                                 continue;
                             }
                             tasks.pop_front().unwrap()
@@ -176,7 +177,7 @@ where
                         }
 
                         STORE_WRITE_RAFTDB_TICK_DURATION_HISTOGRAM
-                            .observe(duration_to_sec(now.elapsed()) as f64);
+                            .observe(duration_to_sec(now_ts.elapsed()) as f64);
                     }
                 })
                 .unwrap();
@@ -1407,7 +1408,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
         );
         let async_writer = Arc::new(Mutex::new(AsyncWriter::new(engines.raft.clone(),
             self.router.clone(), "raftstore-async-writer".to_string(),
-            cfg.value().store_io_pool_size as usize, cfg.value().store_io_queue as usize)));
+            cfg.value().store_io_pool_size as usize, cfg.value().store_io_min_interval_us)));
         let mut builder = RaftPollerBuilder {
             cfg,
             store: meta,
