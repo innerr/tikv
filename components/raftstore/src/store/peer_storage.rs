@@ -1025,13 +1025,11 @@ where
     // to the return one.
     // WARNING: If this function returns error, the caller must panic otherwise the entry cache may
     // be wrong and break correctness.
-    pub fn append<H: HandleRaftReadyContext<EK::WriteBatch, ER::LogBatch>>(
+    pub fn append(
         &mut self,
         invoke_ctx: &mut InvokeContext,
         entries: Vec<Entry>,
-        ready_ctx: &mut H,
-        ready_number: u64,
-        region_notifier: Arc<AtomicU64>,
+        raft_wb: &mut ER::LogBatch,
     ) -> Result<u64> {
         let region_id = self.get_region_id();
         debug!(
@@ -1059,17 +1057,10 @@ where
             cache.append(&self.tag, &entries);
         }
 
-        {
-            let raft_wb_pool = ready_ctx.raft_wb_pool();
-            let mut raft_wbs = raft_wb_pool.lock().unwrap();
-            let current = raft_wbs.front_mut().unwrap();
-            current.wb.append(region_id, entries)?;
-            current.unsynced_readies.insert(region_id,
-                UnsyncedReady{number: ready_number, region_id, notifier: region_notifier, version: 0});
-            // Delete any previously appended log entries which never committed.
-            // TODO: Wrap it as an engine::Error.
-            current.wb.cut_logs(region_id, last_index + 1, prev_last_index);
-        }
+        raft_wb.append(region_id, entries)?;
+        // Delete any previously appended log entries which never committed.
+        // TODO: Wrap it as an engine::Error.
+        raft_wb.cut_logs(region_id, last_index + 1, prev_last_index);
 
         invoke_ctx.raft_state.set_last_index(last_index);
         invoke_ctx.last_term = last_term;
@@ -1406,8 +1397,13 @@ where
             last_index(&ctx.raft_state)
         };
 
+        let (_, raft_wb_pool) = ready_ctx.wb_mut();
+        let mut raft_wbs = raft_wb_pool.lock().unwrap();
+        let current = raft_wbs.front_mut().unwrap();
+        current.unsynced_readies.insert(region_id,
+            UnsyncedReady{number: ready.number(), region_id, notifier: region_notifier.clone(), version: 0});
         if !ready.entries().is_empty() {
-            self.append(&mut ctx, ready.take_entries(), ready_ctx, ready.number(), region_notifier.clone())?;
+            self.append(&mut ctx, ready.take_entries(), &mut current.wb)?;
         }
 
         // Last index is 0 means the peer is created from raft message
@@ -1420,12 +1416,7 @@ where
 
         // Save raft state if it has changed or there is a snapshot.
         if ctx.raft_state != self.raft_state || snapshot_index > 0 {
-            {
-                let raft_wb_pool = ready_ctx.raft_wb_pool();
-                let mut raft_wbs = raft_wb_pool.lock().unwrap();
-                let current = raft_wbs.front_mut().unwrap();
-                ctx.save_raft_state_to(&mut current.wb)?;
-            }
+            ctx.save_raft_state_to(&mut current.wb)?;
             if snapshot_index > 0 {
                 // in case of restart happen when we just write region state to Applying,
                 // but not write raft_local_state to raft rocksdb in time.
