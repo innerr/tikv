@@ -128,10 +128,8 @@ where
         tag: String,
         pool_size: usize,
         io_min_interval_us: u64,
-        io_max_bytes: u64,
+        tasks: AsyncWriterTasks<ER>,
     ) -> AsyncWriter<EK, ER> {
-        //let tasks = AsyncWriterTasks::new(engine.clone(), pool_size * 3, io_max_bytes as usize);
-        let tasks = AsyncWriterTasks::new(engine.clone(), pool_size + 1, io_max_bytes as usize);
         let mut async_writer = AsyncWriter {
             engine,
             router,
@@ -1414,13 +1412,20 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             cfg.value().delay_sync_enabled(),
             cfg.value().delay_sync_us as i64,
         );
+        let async_writer_tasks = AsyncWriterTasks::new(
+            engines.raft.clone(),
+            (cfg.value().store_io_pool_size as usize) + 1,
+            cfg.value().store_io_queue_init_bytes as usize,
+            cfg.value().store_io_queue_bytes_step,
+            cfg.value().store_io_queue_sample_size as usize,
+        );
         let async_writer = Arc::new(Mutex::new(AsyncWriter::new(
             engines.raft.clone(),
             self.router.clone(),
             "raftstore-async-writer".to_string(),
             cfg.value().store_io_pool_size as usize,
             cfg.value().store_io_min_interval_us,
-            cfg.value().store_io_max_bytes,
+            async_writer_tasks,
         )));
         let mut builder = RaftPollerBuilder {
             cfg,

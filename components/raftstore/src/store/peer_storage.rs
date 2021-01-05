@@ -317,6 +317,106 @@ where
     pub unsynced_readies: HashMap<u64, UnsyncedReady>,
 }
 
+impl<WR> AsyncWriterTask<WR>
+where
+    WR: RaftLogBatch,
+{
+    pub fn on_written(
+        &mut self,
+        region_id: u64,
+        ready_number: u64,
+        region_notifier: Arc<AtomicU64>,
+    ) {
+        self.unsynced_readies.insert(
+            region_id,
+            UnsyncedReady {
+                number: ready_number,
+                region_id,
+                notifier: region_notifier,
+                version: 0,
+            },
+        );
+    }
+}
+
+/*
+pub struct AsyncWriterTasks<ER>
+where
+    ER: RaftEngine,
+{
+    wbs: VecDeque<AsyncWriterTask<ER::LogBatch>>,
+}
+
+impl<ER> AsyncWriterTasks<ER>
+where
+    ER: RaftEngine,
+{
+    pub fn new(
+        engine: ER,
+        queue_size: usize,
+        _queue_init_bytes: usize,
+        _queue_bytes_step: f64,
+        _queue_sample_size: f64,
+    ) -> AsyncWriterTasks<ER> {
+        let mut wbs = VecDeque::default();
+        for _ in 0..queue_size {
+            wbs.push_back(AsyncWriterTask {
+                wb: engine.log_batch(4 * 1024),
+                unsynced_readies: HashMap::default(),
+            });
+        }
+        AsyncWriterTasks {
+            wbs,
+        }
+    }
+
+    pub fn prepare_current_for_write(&mut self) -> &mut AsyncWriterTask<ER::LogBatch> {
+        self.wbs.front_mut().unwrap()
+    }
+
+    pub fn no_task(&self) -> bool {
+        self.wbs.front().unwrap().unsynced_readies.is_empty()
+    }
+
+    pub fn detach_task(&mut self) -> AsyncWriterTask<ER::LogBatch> {
+        self.wbs.pop_front().unwrap()
+    }
+
+    pub fn add(&mut self, task: AsyncWriterTask<ER::LogBatch>) {
+        self.wbs.push_back(task);
+    }
+}
+*/
+
+pub struct SampleWindow {
+    que: VecDeque<f64>,
+    size: usize,
+    sum: f64,
+    recal_counter: usize,
+}
+
+impl SampleWindow {
+    pub fn new(size: usize) -> SampleWindow {
+        SampleWindow { que: VecDeque::default(), size, sum: 0.0, recal_counter: 0 }
+    }
+
+    pub fn observe_and_get_avg(&mut self, value: f64) -> f64 {
+        self.que.push_back(value);
+        if self.que.len() > self.size {
+            let old = self.que.pop_front().unwrap();
+            self.sum = self.sum + value - old;
+        } else {
+            self.sum += value;
+        }
+        self.recal_counter += 1;
+        if self.recal_counter > self.size * 1000 {
+            self.recal_counter = 0;
+            self.sum = self.que.iter().sum();
+        }
+        self.sum / (self.que.len() as f64)
+    }
+}
+
 pub struct AsyncWriterTasks<ER>
 where
     ER: RaftEngine,
@@ -324,9 +424,8 @@ where
     wbs: VecDeque<AsyncWriterTask<ER::LogBatch>>,
     size_limits: Vec<usize>,
     current_idx: usize,
-    sample_window: VecDeque<usize>,
-    sample_window_size: usize,
     adaptive_idx: usize,
+    sample_window: SampleWindow,
 }
 
 // TODO: make sure the queue size is good when doing pop/front
@@ -334,7 +433,13 @@ impl<ER> AsyncWriterTasks<ER>
 where
     ER: RaftEngine,
 {
-    pub fn new(engine: ER, queue_size: usize, task_soft_max_bytes: usize) -> AsyncWriterTasks<ER> {
+    pub fn new(
+        engine: ER,
+        queue_size: usize,
+        queue_init_bytes: usize,
+        queue_bytes_step: f64,
+        queue_sample_size: usize,
+    ) -> AsyncWriterTasks<ER> {
         let mut wbs = VecDeque::default();
         for _ in 0..queue_size {
             wbs.push_back(AsyncWriterTask {
@@ -343,27 +448,26 @@ where
             });
         }
         let mut size_limits = vec![];
-        let mut size_limit = task_soft_max_bytes;
-        for _ in 0..(queue_size * 10) {
+        let mut size_limit = queue_init_bytes;
+        for _ in 0..(queue_size * 2) {
             size_limits.push(size_limit);
-            size_limit = (size_limit as f64 * 1.2) as usize;
+            size_limit = (size_limit as f64 * queue_bytes_step) as usize;
         }
         AsyncWriterTasks {
             wbs,
             size_limits,
             current_idx: 0,
-            sample_window: VecDeque::default(),
-            sample_window_size: 4,
             adaptive_idx: 0,
+            sample_window: SampleWindow::new(queue_sample_size),
         }
     }
 
-    pub fn prepare_current_for_write(
-        &mut self,
-        region_id: u64,
-        ready_number: u64,
-        region_notifier: Arc<AtomicU64>,
-    ) -> &mut AsyncWriterTask<ER::LogBatch> {
+    pub fn current(&self) -> &AsyncWriterTask<ER::LogBatch> {
+        assert!(self.current_idx <= self.wbs.len());
+        &self.wbs[self.current_idx]
+    }
+
+    pub fn prepare_current_for_write(&mut self) -> &mut AsyncWriterTask<ER::LogBatch> {
         assert!(self.current_idx <= self.wbs.len());
         let current_size = {
             self.wbs[self.current_idx].wb.persist_size()
@@ -376,27 +480,6 @@ where
                 // do nothing, adaptive IO size
             }
         }
-        let current = &mut self.wbs[self.current_idx];
-
-        current.unsynced_readies.insert(
-            region_id,
-            UnsyncedReady {
-                number: ready_number,
-                region_id,
-                notifier: region_notifier,
-                version: 0,
-            },
-        );
-        current
-    }
-
-    pub fn current(&self) -> &AsyncWriterTask<ER::LogBatch> {
-        assert!(self.current_idx <= self.wbs.len());
-        &self.wbs[self.current_idx]
-    }
-
-    pub fn current_mut(&mut self) -> &mut AsyncWriterTask<ER::LogBatch> {
-        assert!(self.current_idx <= self.wbs.len());
         &mut self.wbs[self.current_idx]
     }
 
@@ -411,17 +494,13 @@ where
     pub fn detach_task(&mut self) -> AsyncWriterTask<ER::LogBatch> {
         RAFT_ASYNC_WRITER_QUEUE_SIZE.observe(self.current_idx as f64);
         RAFT_ASYNC_WRITER_ADAPTIVE_IDX.observe(self.adaptive_idx as f64);
-
         let task = self.wbs.pop_front().unwrap();
         let task_bytes = task.wb.persist_size();
+        RAFT_ASYNC_WRITER_TASK_BYTES.observe(task_bytes as f64);
 
-        self.sample_window.push_back(task_bytes);
-        if self.sample_window.len() > self.sample_window_size {
-            self.sample_window.pop_front();
-        }
+        let task_avg_bytes = self.sample_window.observe_and_get_avg(task_bytes as f64);
         let target_bytes = self.size_limits[self.adaptive_idx + self.current_idx];
-        let task_avg_bytes = (self.sample_window.iter().sum::<usize>() as f64 / self.sample_window.len() as f64) as usize;
-        if task_avg_bytes >= target_bytes {
+        if task_avg_bytes >= (target_bytes as f64) {
             if self.adaptive_idx + 1 + self.wbs.len() - 1 < self.size_limits.len() {
                 self.adaptive_idx += 1;
             }
@@ -441,6 +520,7 @@ where
         self.wbs.push_back(task);
     }
 }
+
 
 pub trait HandleRaftReadyContext<WK, ER>
 where
@@ -1510,15 +1590,7 @@ where
         {
             let raft_wb_pool = ready_ctx.raft_wb_pool();
             let mut raft_wbs = raft_wb_pool.lock().unwrap();
-            let current = if ready.must_sync() {
-                raft_wbs.prepare_current_for_write(
-                    region_id,
-                    ready.number(),
-                    region_notifier.clone(),
-                )
-            } else {
-                raft_wbs.current_mut()
-            };
+            let current = raft_wbs.prepare_current_for_write();
 
             if !ready.snapshot().is_empty() {
                 fail_point!("raft_before_apply_snap");
@@ -1545,8 +1617,7 @@ where
             }
 
             if ready.must_sync() {
-                current.unsynced_readies.insert(region_id,
-                    UnsyncedReady{number: ready.number(), region_id, notifier: region_notifier.clone(), version: 0});
+                current.on_written(region_id, ready.number(), region_notifier.clone());
             }
         }
 
