@@ -1380,54 +1380,50 @@ where
     ) -> Result<InvokeContext> {
         let region_id = self.get_region_id();
         let mut ctx = InvokeContext::new(self);
-        let snapshot_index = if ready.snapshot().is_empty() {
-            0
-        } else {
-            fail_point!("raft_before_apply_snap");
-            let (kv_wb, raft_wb_pool) = ready_ctx.wb_mut();
+        let mut snapshot_index = 0;
+
+        {
+            let raft_wb_pool = ready_ctx.raft_wb_pool();
             let mut raft_wbs = raft_wb_pool.lock().unwrap();
             let current = raft_wbs.front_mut().unwrap();
-            self.apply_snapshot(&mut ctx, ready.snapshot(), kv_wb, &mut current.wb, &destroy_regions)?;
-            current.unsynced_readies.insert(region_id,
-                UnsyncedReady{number: ready.number(), region_id, notifier: region_notifier.clone(), version: 0});
-            fail_point!("raft_after_apply_snap");
 
-            ctx.destroyed_regions = destroy_regions;
+            if !ready.snapshot().is_empty() {
+                fail_point!("raft_before_apply_snap");
+                self.apply_snapshot(&mut ctx, ready.snapshot(), ready_ctx.kv_wb_mut(), &mut current.wb, &destroy_regions)?;
+                fail_point!("raft_after_apply_snap");
+                ctx.destroyed_regions = destroy_regions;
+                snapshot_index = last_index(&ctx.raft_state);
+            };
 
-            last_index(&ctx.raft_state)
-        };
-
-        let (_, raft_wb_pool) = ready_ctx.wb_mut();
-        let mut raft_wbs = raft_wb_pool.lock().unwrap();
-        let current = raft_wbs.front_mut().unwrap();
-        current.unsynced_readies.insert(region_id,
-            UnsyncedReady{number: ready.number(), region_id, notifier: region_notifier.clone(), version: 0});
-        if !ready.entries().is_empty() {
-            self.append(&mut ctx, ready.take_entries(), &mut current.wb)?;
-        }
-
-        // Last index is 0 means the peer is created from raft message
-        // and has not applied snapshot yet, so skip persistent hard state.
-        if ctx.raft_state.get_last_index() > 0 {
-            if let Some(hs) = ready.hs() {
-                ctx.raft_state.set_hard_state(hs.clone());
+            if !ready.entries().is_empty() {
+                self.append(&mut ctx, ready.take_entries(), &mut current.wb)?;
             }
-        }
+            // Last index is 0 means the peer is created from raft message
+            // and has not applied snapshot yet, so skip persistent hard state.
+            if ctx.raft_state.get_last_index() > 0 {
+                if let Some(hs) = ready.hs() {
+                    ctx.raft_state.set_hard_state(hs.clone());
+                }
+            }
 
-        // Save raft state if it has changed or there is a snapshot.
-        if ctx.raft_state != self.raft_state || snapshot_index > 0 {
-            ctx.save_raft_state_to(&mut current.wb)?;
-            if snapshot_index > 0 {
-                // in case of restart happen when we just write region state to Applying,
-                // but not write raft_local_state to raft rocksdb in time.
-                // we write raft state to default rocksdb, with last index set to snap index,
-                // in case of recv raft log after snapshot.
-                ctx.save_snapshot_raft_state_to(snapshot_index, ready_ctx.kv_wb_mut())?;
+            // Save raft state if it has changed or there is a snapshot.
+            if ctx.raft_state != self.raft_state || snapshot_index > 0 {
+                ctx.save_raft_state_to(&mut current.wb)?;
+            }
+
+            if ready.must_sync() {
+                current.unsynced_readies.insert(region_id,
+                    UnsyncedReady{number: ready.number(), region_id, notifier: region_notifier.clone(), version: 0});
             }
         }
 
         // only when apply snapshot
         if snapshot_index > 0 {
+            // in case of restart happen when we just write region state to Applying,
+            // but not write raft_local_state to raft rocksdb in time.
+            // we write raft state to default rocksdb, with last index set to snap index,
+            // in case of recv raft log after snapshot.
+            ctx.save_snapshot_raft_state_to(snapshot_index, ready_ctx.kv_wb_mut())?;
             ctx.save_apply_state_to(ready_ctx.kv_wb_mut())?;
         }
 
