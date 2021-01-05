@@ -1,10 +1,10 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::collections::VecDeque;
+use std::mem;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicI64, AtomicU64};
 use std::sync::Arc;
-use std::mem;
 
 use crossbeam::utils::CachePadded;
 use engine_traits::KvEngine;

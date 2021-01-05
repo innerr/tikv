@@ -25,16 +25,16 @@ use crate::store::ProposalContext;
 use crate::{Error, Result};
 use engine_traits::{RaftEngine, RaftLogBatch};
 use into_other::into_other;
-use tikv_util::worker::Scheduler;
 use std::sync::Mutex;
+use tikv_util::worker::Scheduler;
 
 use super::metrics::*;
 use super::worker::RegionTask;
 use super::{SnapEntry, SnapKey, SnapManager, SnapshotStatistics};
 
-use tikv_util::collections::HashMap;
 use crate::store::fsm::sync_policy::UnsyncedReady;
 use std::sync::atomic::AtomicU64;
+use tikv_util::collections::HashMap;
 
 // When we create a region peer, we should initialize its log term/index > 0,
 // so that we can force the follower peer to sync the snapshot first.
@@ -317,16 +317,141 @@ where
     pub unsynced_readies: HashMap<u64, UnsyncedReady>,
 }
 
-pub trait HandleRaftReadyContext<WK, WR>
+pub struct AsyncWriterTasks<ER>
+where
+    ER: RaftEngine,
+{
+    wbs: VecDeque<AsyncWriterTask<ER::LogBatch>>,
+    size_limits: Vec<usize>,
+    current_idx: usize,
+    sample_window: VecDeque<usize>,
+    sample_window_size: usize,
+    adaptive_idx: usize,
+}
+
+// TODO: make sure the queue size is good when doing pop/front
+impl<ER> AsyncWriterTasks<ER>
+where
+    ER: RaftEngine,
+{
+    pub fn new(engine: ER, queue_size: usize, task_soft_max_bytes: usize) -> AsyncWriterTasks<ER> {
+        let mut wbs = VecDeque::default();
+        for _ in 0..queue_size {
+            wbs.push_back(AsyncWriterTask {
+                wb: engine.log_batch(4 * 1024),
+                unsynced_readies: HashMap::default(),
+            });
+        }
+        let mut size_limits = vec![];
+        let mut size_limit = task_soft_max_bytes;
+        for _ in 0..(queue_size * 10) {
+            size_limits.push(size_limit);
+            size_limit = (size_limit as f64 * 1.2) as usize;
+        }
+        AsyncWriterTasks {
+            wbs,
+            size_limits,
+            current_idx: 0,
+            sample_window: VecDeque::default(),
+            sample_window_size: 4,
+            adaptive_idx: 0,
+        }
+    }
+
+    pub fn prepare_current_for_write(
+        &mut self,
+        region_id: u64,
+        ready_number: u64,
+        region_notifier: Arc<AtomicU64>,
+    ) -> &mut AsyncWriterTask<ER::LogBatch> {
+        assert!(self.current_idx <= self.wbs.len());
+        let current_size = {
+            self.wbs[self.current_idx].wb.persist_size()
+        };
+        if current_size >= self.size_limits[self.adaptive_idx + self.current_idx] {
+            if self.current_idx + 1 < self.wbs.len() {
+                self.current_idx += 1;
+                assert!(self.wbs[self.current_idx].unsynced_readies.len() == 0);
+            } else {
+                // do nothing, adaptive IO size
+            }
+        }
+        let current = &mut self.wbs[self.current_idx];
+
+        current.unsynced_readies.insert(
+            region_id,
+            UnsyncedReady {
+                number: ready_number,
+                region_id,
+                notifier: region_notifier,
+                version: 0,
+            },
+        );
+        current
+    }
+
+    pub fn current(&self) -> &AsyncWriterTask<ER::LogBatch> {
+        assert!(self.current_idx <= self.wbs.len());
+        &self.wbs[self.current_idx]
+    }
+
+    pub fn current_mut(&mut self) -> &mut AsyncWriterTask<ER::LogBatch> {
+        assert!(self.current_idx <= self.wbs.len());
+        &mut self.wbs[self.current_idx]
+    }
+
+    pub fn no_task(&self) -> bool {
+        let no_task = self.wbs.front().unwrap().unsynced_readies.is_empty();
+        if no_task {
+            assert!(self.current_idx == 0);
+        }
+        no_task
+    }
+
+    pub fn detach_task(&mut self) -> AsyncWriterTask<ER::LogBatch> {
+        RAFT_ASYNC_WRITER_QUEUE_SIZE.observe(self.current_idx as f64);
+        RAFT_ASYNC_WRITER_ADAPTIVE_IDX.observe(self.adaptive_idx as f64);
+
+        let task = self.wbs.pop_front().unwrap();
+        let task_bytes = task.wb.persist_size();
+
+        self.sample_window.push_back(task_bytes);
+        if self.sample_window.len() > self.sample_window_size {
+            self.sample_window.pop_front();
+        }
+        let target_bytes = self.size_limits[self.adaptive_idx + self.current_idx];
+        let task_avg_bytes = (self.sample_window.iter().sum::<usize>() as f64 / self.sample_window.len() as f64) as usize;
+        if task_avg_bytes >= target_bytes {
+            if self.adaptive_idx + 1 + self.wbs.len() - 1 < self.size_limits.len() {
+                self.adaptive_idx += 1;
+            }
+        } else if (task_avg_bytes as f64) < ((target_bytes as f64) / 1.25) {
+            if self.adaptive_idx > 0 {
+                self.adaptive_idx -= 1;
+            }
+        }
+
+        if self.current_idx != 0 {
+            self.current_idx -= 1;
+        }
+        task
+    }
+
+    pub fn add(&mut self, task: AsyncWriterTask<ER::LogBatch>) {
+        self.wbs.push_back(task);
+    }
+}
+
+pub trait HandleRaftReadyContext<WK, ER>
 where
     WK: Mutable,
-    WR: RaftLogBatch,
+    ER: RaftEngine,
 {
     /// Returns the mutable references of WriteBatch for both KvDB and RaftDB in one interface.
-    fn wb_mut(&mut self) -> (&mut WK, Arc<Mutex<VecDeque<AsyncWriterTask<WR>>>>);
+    fn wb_mut(&mut self) -> (&mut WK, Arc<Mutex<AsyncWriterTasks<ER>>>);
     fn kv_wb_mut(&mut self) -> &mut WK;
     //fn raft_wb_mut(&mut self) -> &mut WR;
-    fn raft_wb_pool(&mut self) -> Arc<Mutex<VecDeque<AsyncWriterTask<WR>>>>;
+    fn raft_wb_pool(&mut self) -> Arc<Mutex<AsyncWriterTasks<ER>>>;
     fn sync_log(&self) -> bool;
     fn set_sync_log(&mut self, sync: bool);
 }
@@ -1025,13 +1150,11 @@ where
     // to the return one.
     // WARNING: If this function returns error, the caller must panic otherwise the entry cache may
     // be wrong and break correctness.
-    pub fn append<H: HandleRaftReadyContext<EK::WriteBatch, ER::LogBatch>>(
+    pub fn append(
         &mut self,
         invoke_ctx: &mut InvokeContext,
         entries: Vec<Entry>,
-        ready_ctx: &mut H,
-        ready_number: u64,
-        region_notifier: Arc<AtomicU64>,
+        raft_wb: &mut ER::LogBatch,
     ) -> Result<u64> {
         let region_id = self.get_region_id();
         debug!(
@@ -1059,17 +1182,10 @@ where
             cache.append(&self.tag, &entries);
         }
 
-        {
-            let raft_wb_pool = ready_ctx.raft_wb_pool();
-            let mut raft_wbs = raft_wb_pool.lock().unwrap();
-            let current = raft_wbs.front_mut().unwrap();
-            current.wb.append(region_id, entries)?;
-            current.unsynced_readies.insert(region_id,
-                UnsyncedReady{number: ready_number, region_id, notifier: region_notifier, version: 0});
-            // Delete any previously appended log entries which never committed.
-            // TODO: Wrap it as an engine::Error.
-            current.wb.cut_logs(region_id, last_index + 1, prev_last_index);
-        }
+        raft_wb.append(region_id, entries)?;
+        // Delete any previously appended log entries which never committed.
+        // TODO: Wrap it as an engine::Error.
+        raft_wb.cut_logs(region_id, last_index + 1, prev_last_index);
 
         invoke_ctx.raft_state.set_last_index(last_index);
         invoke_ctx.last_term = last_term;
@@ -1380,7 +1496,7 @@ where
     /// it explicitly to disk. If it's flushed to disk successfully, `post_ready` should be called
     /// to update the memory states properly.
     /// WARNING: If this function returns error, the caller must panic(details in `append` function).
-    pub fn handle_raft_ready<H: HandleRaftReadyContext<EK::WriteBatch, ER::LogBatch>>(
+    pub fn handle_raft_ready<H: HandleRaftReadyContext<EK::WriteBatch, ER>>(
         &mut self,
         ready_ctx: &mut H,
         ready: &mut Ready,
@@ -1389,54 +1505,58 @@ where
     ) -> Result<InvokeContext> {
         let region_id = self.get_region_id();
         let mut ctx = InvokeContext::new(self);
-        let snapshot_index = if ready.snapshot().is_empty() {
-            0
-        } else {
-            fail_point!("raft_before_apply_snap");
-            let (kv_wb, raft_wb_pool) = ready_ctx.wb_mut();
+        let mut snapshot_index = 0;
+
+        {
+            let raft_wb_pool = ready_ctx.raft_wb_pool();
             let mut raft_wbs = raft_wb_pool.lock().unwrap();
-            let current = raft_wbs.front_mut().unwrap();
-            self.apply_snapshot(&mut ctx, ready.snapshot(), kv_wb, &mut current.wb, &destroy_regions)?;
-            current.unsynced_readies.insert(region_id,
-                UnsyncedReady{number: ready.number(), region_id, notifier: region_notifier.clone(), version: 0});
-            fail_point!("raft_after_apply_snap");
+            let current = if ready.must_sync() {
+                raft_wbs.prepare_current_for_write(
+                    region_id,
+                    ready.number(),
+                    region_notifier.clone(),
+                )
+            } else {
+                raft_wbs.current_mut()
+            };
 
-            ctx.destroyed_regions = destroy_regions;
+            if !ready.snapshot().is_empty() {
+                fail_point!("raft_before_apply_snap");
+                self.apply_snapshot(&mut ctx, ready.snapshot(), ready_ctx.kv_wb_mut(), &mut current.wb, &destroy_regions)?;
+                fail_point!("raft_after_apply_snap");
+                ctx.destroyed_regions = destroy_regions;
+                snapshot_index = last_index(&ctx.raft_state);
+            };
 
-            last_index(&ctx.raft_state)
-        };
-
-        if !ready.entries().is_empty() {
-            self.append(&mut ctx, ready.take_entries(), ready_ctx, ready.number(), region_notifier.clone())?;
-        }
-
-        // Last index is 0 means the peer is created from raft message
-        // and has not applied snapshot yet, so skip persistent hard state.
-        if ctx.raft_state.get_last_index() > 0 {
-            if let Some(hs) = ready.hs() {
-                ctx.raft_state.set_hard_state(hs.clone());
+            if !ready.entries().is_empty() {
+                self.append(&mut ctx, ready.take_entries(), &mut current.wb)?;
             }
-        }
+            // Last index is 0 means the peer is created from raft message
+            // and has not applied snapshot yet, so skip persistent hard state.
+            if ctx.raft_state.get_last_index() > 0 {
+                if let Some(hs) = ready.hs() {
+                    ctx.raft_state.set_hard_state(hs.clone());
+                }
+            }
 
-        // Save raft state if it has changed or there is a snapshot.
-        if ctx.raft_state != self.raft_state || snapshot_index > 0 {
-            {
-                let raft_wb_pool = ready_ctx.raft_wb_pool();
-                let mut raft_wbs = raft_wb_pool.lock().unwrap();
-                let current = raft_wbs.front_mut().unwrap();
+            // Save raft state if it has changed or there is a snapshot.
+            if ctx.raft_state != self.raft_state || snapshot_index > 0 {
                 ctx.save_raft_state_to(&mut current.wb)?;
             }
-            if snapshot_index > 0 {
-                // in case of restart happen when we just write region state to Applying,
-                // but not write raft_local_state to raft rocksdb in time.
-                // we write raft state to default rocksdb, with last index set to snap index,
-                // in case of recv raft log after snapshot.
-                ctx.save_snapshot_raft_state_to(snapshot_index, ready_ctx.kv_wb_mut())?;
+
+            if ready.must_sync() {
+                current.unsynced_readies.insert(region_id,
+                    UnsyncedReady{number: ready.number(), region_id, notifier: region_notifier.clone(), version: 0});
             }
         }
 
         // only when apply snapshot
         if snapshot_index > 0 {
+            // in case of restart happen when we just write region state to Applying,
+            // but not write raft_local_state to raft rocksdb in time.
+            // we write raft state to default rocksdb, with last index set to snap index,
+            // in case of recv raft log after snapshot.
+            ctx.save_snapshot_raft_state_to(snapshot_index, ready_ctx.kv_wb_mut())?;
             ctx.save_apply_state_to(ready_ctx.kv_wb_mut())?;
         }
 

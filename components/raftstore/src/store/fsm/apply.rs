@@ -925,9 +925,11 @@ where
         if !data.is_empty() {
             let cmd = util::parse_data_at(data, index, &self.tag);
 
-            if should_write_to_engine(&cmd) ||
-                (apply_ctx.apply_io_size != 0 && (apply_ctx.kv_wb().data_size() >= apply_ctx.apply_io_size)) ||
-                (apply_ctx.apply_io_size == 0 && apply_ctx.kv_wb().should_write_to_engine()) {
+            if should_write_to_engine(&cmd)
+                || (apply_ctx.apply_io_size != 0
+                    && (apply_ctx.kv_wb().data_size() >= apply_ctx.apply_io_size))
+                || (apply_ctx.apply_io_size == 0 && apply_ctx.kv_wb().should_write_to_engine())
+            {
                 apply_ctx.commit(self);
                 if let Some(start) = self.handle_start.as_ref() {
                     if start.elapsed() >= apply_ctx.yield_duration {

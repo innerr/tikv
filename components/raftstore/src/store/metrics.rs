@@ -180,12 +180,6 @@ make_auto_flush_static_metric! {
 }
 
 lazy_static! {
-    pub static ref ASYNC_WRITER_IO_QUEUE_VEC: IntGaugeVec =
-        register_int_gauge_vec!(
-            "tikv_raftstore_async_writer_io_queue_total",
-            "Current pending + running io tasks.",
-            &["name"]
-        ).unwrap();
     pub static ref STORE_LOOP_DURATION_HISTOGRAM: Histogram =
         register_histogram!(
             "tikv_raftstore_store_loop_duration_seconds",
@@ -222,6 +216,13 @@ lazy_static! {
             "TODO",
             exponential_buckets(1.0, 2.0, 20).unwrap()
         ).unwrap();
+    pub static ref RAFT_ASYNC_WRITER_ADAPTIVE_IDX: Histogram =
+        register_histogram!(
+            "tikv_raftstore_store_adaptive_idx",
+            "TODO",
+            exponential_buckets(1.0, 2.0, 20).unwrap()
+        ).unwrap();
+
 
     pub static ref PEER_PROPOSAL_COUNTER_VEC: IntCounterVec =
         register_int_counter_vec!(

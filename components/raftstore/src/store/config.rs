@@ -33,6 +33,8 @@ pub struct Config {
     #[config(skip)]
     pub store_io_min_interval_us: u64,
     #[config(skip)]
+    pub store_io_max_bytes: u64,
+    #[config(skip)]
     pub store_io_pool_size: u64,
     #[config(skip)]
     pub store_io_queue: u64,
@@ -205,6 +207,7 @@ impl Default for Config {
         Config {
             delay_sync_us: 0,
             store_io_min_interval_us: 500,
+            store_io_max_bytes: 128 * 1024,
             store_io_pool_size: 2,
             store_io_queue: 1,
             apply_io_size: 0,
@@ -436,6 +439,9 @@ impl Config {
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["store_io_min_interval_us"])
             .set((self.store_io_min_interval_us as i32).into());
+        CONFIG_RAFTSTORE_GAUGE
+            .with_label_values(&["store_io_max_bytes"])
+            .set((self.store_io_max_bytes as i32).into());
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["store_io_pool_size"])
             .set((self.store_io_pool_size as i32).into());

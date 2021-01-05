@@ -83,6 +83,7 @@ pub const PENDING_MSG_CAP: usize = 100;
 const UNREACHABLE_BACKOFF: Duration = Duration::from_secs(10);
 
 use crate::store::peer_storage::AsyncWriterTask;
+use crate::store::peer_storage::AsyncWriterTasks;
 use std::collections::VecDeque;
 use std::thread::JoinHandle;
 
@@ -95,7 +96,7 @@ where
     router: RaftRouter<EK, ER>,
     tag: String,
     io_min_interval: Duration,
-    tasks: Arc<Mutex<VecDeque<AsyncWriterTask<ER::LogBatch>>>>,
+    tasks: Arc<Mutex<AsyncWriterTasks<ER>>>,
     workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
@@ -105,7 +106,7 @@ where
     ER: RaftEngine,
 {
     fn clone(&self) -> Self {
-        AsyncWriter{
+        AsyncWriter {
             engine: self.engine.clone(),
             router: self.router.clone(),
             tag: self.tag.clone(),
@@ -121,18 +122,17 @@ where
     EK: KvEngine,
     ER: RaftEngine,
 {
-    pub fn new(engine: ER, router: RaftRouter<EK, ER>, tag: String,
-        pool_size: usize, io_min_interval_us: u64) -> AsyncWriter<EK, ER> {
-        let mut tasks = VecDeque::default();
-        for _ in 0..(pool_size + 1) {
-            tasks.push_back(
-                AsyncWriterTask {
-                    wb: engine.log_batch(4 * 1024),
-                    unsynced_readies: HashMap::default(),
-                }
-            );
-        }
-        let mut async_writer = AsyncWriter{
+    pub fn new(
+        engine: ER,
+        router: RaftRouter<EK, ER>,
+        tag: String,
+        pool_size: usize,
+        io_min_interval_us: u64,
+        io_max_bytes: u64,
+    ) -> AsyncWriter<EK, ER> {
+        //let tasks = AsyncWriterTasks::new(engine.clone(), pool_size * 3, io_max_bytes as usize);
+        let tasks = AsyncWriterTasks::new(engine.clone(), pool_size + 1, io_max_bytes as usize);
+        let mut async_writer = AsyncWriter {
             engine,
             router,
             tag,
@@ -160,20 +160,23 @@ where
                         }
                         last_ts = now_ts;
 
-                        // TODO: block if too many data in current raft_wb
                         let task = {
                             let mut tasks = x.tasks.lock().unwrap();
-                            if tasks.front().unwrap().unsynced_readies.is_empty() {
+                            if tasks.no_task() {
                                 continue;
                             }
-                            tasks.pop_front().unwrap()
+                            tasks.detach_task()
                         };
 
                         let wb = x.sync_write(task.wb, task.unsynced_readies);
 
+                        // TODO: block if too many tasks
                         {
                             let mut tasks = x.tasks.lock().unwrap();
-                            tasks.push_back(AsyncWriterTask{wb, unsynced_readies: HashMap::default()});
+                            tasks.add(AsyncWriterTask {
+                                wb,
+                                unsynced_readies: HashMap::default(),
+                            });
                         }
 
                         STORE_WRITE_RAFTDB_TICK_DURATION_HISTOGRAM
@@ -186,12 +189,16 @@ where
         }
     }
 
-    pub fn raft_wb_pool(&mut self) -> Arc<Mutex<VecDeque<AsyncWriterTask<ER::LogBatch>>>> {
+    pub fn raft_wb_pool(&mut self) -> Arc<Mutex<AsyncWriterTasks<ER>>> {
         self.tasks.clone()
     }
 
     // TODO: this func is assumed in tasks.locked status
-    pub fn sync_write(&mut self, mut wb: ER::LogBatch, mut unsynced_readies: HashMap<u64, UnsyncedReady>) -> ER::LogBatch {
+    pub fn sync_write(
+        &mut self,
+        mut wb: ER::LogBatch,
+        mut unsynced_readies: HashMap<u64, UnsyncedReady>,
+    ) -> ER::LogBatch {
         let now = TiInstant::now_coarse();
         self.engine
             .consume_and_shrink(&mut wb, true, RAFT_WB_SHRINK_SIZE, 4 * 1024)
@@ -224,7 +231,10 @@ where
             if pre_number >= r.number {
                 break;
             }
-            if pre_number == r.notifier.compare_and_swap(pre_number, r.number, Ordering::AcqRel) {
+            if pre_number
+                == r.notifier
+                    .compare_and_swap(pre_number, r.number, Ordering::AcqRel)
+            {
                 if let Err(e) = self.router.force_send(r.region_id, PeerMsg::Noop) {
                     error!(
                         "failed to send noop to trigger persisted ready";
@@ -500,12 +510,12 @@ where
     pub async_writer: Arc<Mutex<AsyncWriter<EK, ER>>>,
 }
 
-impl<EK, ER, T> HandleRaftReadyContext<EK::WriteBatch, ER::LogBatch> for PollContext<EK, ER, T>
+impl<EK, ER, T> HandleRaftReadyContext<EK::WriteBatch, ER> for PollContext<EK, ER, T>
 where
     EK: KvEngine,
     ER: RaftEngine,
 {
-    fn wb_mut(&mut self) -> (&mut EK::WriteBatch, Arc::<Mutex<VecDeque<AsyncWriterTask<ER::LogBatch>>>>) {
+    fn wb_mut(&mut self) -> (&mut EK::WriteBatch, Arc<Mutex<AsyncWriterTasks<ER>>>) {
         self.raft_wb_is_empty = false;
         let mut async_writer = self.async_writer.lock().unwrap();
         (&mut self.kv_wb, async_writer.raft_wb_pool())
@@ -517,7 +527,7 @@ where
     }
 
     #[inline]
-    fn raft_wb_pool(&mut self) -> Arc<Mutex<VecDeque<AsyncWriterTask<ER::LogBatch>>>> {
+    fn raft_wb_pool(&mut self) -> Arc<Mutex<AsyncWriterTasks<ER>>> {
         self.raft_wb_is_empty = false;
         let mut async_writer = self.async_writer.lock().unwrap();
         async_writer.raft_wb_pool()
@@ -821,8 +831,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
             }
         }
         fail_point!("raft_between_save");
-        STORE_WRITE_KVDB_DURATION_HISTOGRAM
-            .observe(duration_to_sec(now.elapsed()) as f64);
+        STORE_WRITE_KVDB_DURATION_HISTOGRAM.observe(duration_to_sec(now.elapsed()) as f64);
 
         let raft_wb_is_empty = self.poll_ctx.raft_wb_is_empty;
         if !raft_wb_is_empty {
@@ -933,8 +942,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
         self.poll_ctx.sync_log = false;
         self.poll_ctx.has_ready = false;
         self.timer = TiInstant::now_coarse();
-        STORE_LOOP_DURATION_HISTOGRAM
-            .observe(duration_to_sec(self.loop_timer.elapsed()) as f64);
+        STORE_LOOP_DURATION_HISTOGRAM.observe(duration_to_sec(self.loop_timer.elapsed()) as f64);
         self.loop_timer = TiInstant::now_coarse();
         // update config
         self.poll_ctx.perf_context_statistics.start();
@@ -1406,9 +1414,14 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             cfg.value().delay_sync_enabled(),
             cfg.value().delay_sync_us as i64,
         );
-        let async_writer = Arc::new(Mutex::new(AsyncWriter::new(engines.raft.clone(),
-            self.router.clone(), "raftstore-async-writer".to_string(),
-            cfg.value().store_io_pool_size as usize, cfg.value().store_io_min_interval_us)));
+        let async_writer = Arc::new(Mutex::new(AsyncWriter::new(
+            engines.raft.clone(),
+            self.router.clone(),
+            "raftstore-async-writer".to_string(),
+            cfg.value().store_io_pool_size as usize,
+            cfg.value().store_io_min_interval_us,
+            cfg.value().store_io_max_bytes,
+        )));
         let mut builder = RaftPollerBuilder {
             cfg,
             store: meta,
