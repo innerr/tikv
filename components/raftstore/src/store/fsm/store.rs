@@ -161,6 +161,7 @@ where
                         let task = {
                             let mut tasks = x.tasks.lock().unwrap();
                             if tasks.no_task() {
+                                // TODO: block and wait for new data arrive
                                 continue;
                             }
                             tasks.detach_task()

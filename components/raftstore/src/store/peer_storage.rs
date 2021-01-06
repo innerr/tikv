@@ -337,6 +337,10 @@ where
             },
         );
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.unsynced_readies.is_empty()
+    }
 }
 
 /*
@@ -462,20 +466,16 @@ where
         }
     }
 
-    pub fn current(&self) -> &AsyncWriterTask<ER::LogBatch> {
-        assert!(self.current_idx <= self.wbs.len());
-        &self.wbs[self.current_idx]
-    }
-
     pub fn prepare_current_for_write(&mut self) -> &mut AsyncWriterTask<ER::LogBatch> {
         assert!(self.current_idx <= self.wbs.len());
-        let current_size = {
-            self.wbs[self.current_idx].wb.persist_size()
-        };
+        if self.current_idx + 1 < self.wbs.len() {
+            assert!(self.wbs[self.current_idx + 1].is_empty());
+        }
+        let current_size = self.wbs[self.current_idx].wb.persist_size();
         if current_size >= self.size_limits[self.adaptive_idx + self.current_idx] {
             if self.current_idx + 1 < self.wbs.len() {
                 self.current_idx += 1;
-                assert!(self.wbs[self.current_idx].unsynced_readies.len() == 0);
+                assert!(self.wbs[self.current_idx].is_empty());
             } else {
                 // do nothing, adaptive IO size
             }
@@ -484,7 +484,7 @@ where
     }
 
     pub fn no_task(&self) -> bool {
-        let no_task = self.wbs.front().unwrap().unsynced_readies.is_empty();
+        let no_task = self.wbs.front().unwrap().is_empty();
         if no_task {
             assert!(self.current_idx == 0);
         }
@@ -494,20 +494,30 @@ where
     pub fn detach_task(&mut self) -> AsyncWriterTask<ER::LogBatch> {
         RAFT_ASYNC_WRITER_QUEUE_SIZE.observe(self.current_idx as f64);
         RAFT_ASYNC_WRITER_ADAPTIVE_IDX.observe(self.adaptive_idx as f64);
+
+        assert!(self.current_idx <= self.wbs.len());
+        if self.current_idx + 1 < self.wbs.len() {
+            assert!(self.wbs[self.current_idx + 1].is_empty());
+        }
+        if self.current_idx != 0 {
+            assert!(!self.wbs[self.current_idx - 1].is_empty());
+        }
         let task = self.wbs.pop_front().unwrap();
+        assert!(!task.is_empty());
+
         let task_bytes = task.wb.persist_size();
         RAFT_ASYNC_WRITER_TASK_BYTES.observe(task_bytes as f64);
 
         let task_avg_bytes = self.sample_window.observe_and_get_avg(task_bytes as f64);
-        let target_bytes = self.size_limits[self.adaptive_idx + self.current_idx];
-        if task_avg_bytes >= (target_bytes as f64) {
-            if self.adaptive_idx + 1 + self.wbs.len() - 1 < self.size_limits.len() {
+        let target_bytes = self.size_limits[self.adaptive_idx + self.current_idx] as f64;
+        RAFT_ASYNC_WRITER_TASK_LIMIT_BYTES.observe(target_bytes);
+        if task_avg_bytes >= target_bytes {
+            if self.adaptive_idx + (self.wbs.len() - 1) + 1 < self.size_limits.len() {
                 self.adaptive_idx += 1;
             }
-        } else if (task_avg_bytes as f64) < ((target_bytes as f64) / 1.25) {
-            if self.adaptive_idx > 0 {
-                self.adaptive_idx -= 1;
-            }
+        } else if self.adaptive_idx > 0 &&
+            task_avg_bytes < (self.size_limits[self.adaptive_idx + self.current_idx - 1] as f64) {
+            self.adaptive_idx -= 1;
         }
 
         if self.current_idx != 0 {
@@ -517,10 +527,10 @@ where
     }
 
     pub fn add(&mut self, task: AsyncWriterTask<ER::LogBatch>) {
+        assert!(task.is_empty());
         self.wbs.push_back(task);
     }
 }
-
 
 pub trait HandleRaftReadyContext<WK, ER>
 where
@@ -1591,6 +1601,7 @@ where
             let raft_wb_pool = ready_ctx.raft_wb_pool();
             let mut raft_wbs = raft_wb_pool.lock().unwrap();
             let current = raft_wbs.prepare_current_for_write();
+            let current_size = current.wb.persist_size();
 
             if !ready.snapshot().is_empty() {
                 fail_point!("raft_before_apply_snap");
@@ -1617,6 +1628,7 @@ where
             }
 
             if ready.must_sync() {
+                assert!(current_size != current.wb.persist_size());
                 current.on_written(region_id, ready.number(), region_notifier.clone());
             }
         }

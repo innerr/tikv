@@ -226,7 +226,13 @@ lazy_static! {
         register_histogram!(
             "tikv_raftstore_store_task_bytes",
             "TODO",
-            exponential_buckets(1024.0, 2.0, 30).unwrap()
+            exponential_buckets(256.0, 2.0, 30).unwrap()
+        ).unwrap();
+    pub static ref RAFT_ASYNC_WRITER_TASK_LIMIT_BYTES: Histogram =
+        register_histogram!(
+            "tikv_raftstore_store_task_limit_bytes",
+            "TODO",
+            exponential_buckets(256.0, 2.0, 30).unwrap()
         ).unwrap();
 
 
