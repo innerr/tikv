@@ -41,7 +41,9 @@ pub struct Config {
     #[config(skip)]
     pub store_io_queue_bytes_step: f64,
     #[config(skip)]
-    pub store_io_queue_sample_size: u64,
+    pub store_io_queue_sample_quantile: f64,
+    #[config(skip)]
+    pub store_io_queue_adaptive_gain: u64,
     #[config(skip)]
     pub apply_io_size: u64,
     // minimizes disruption when a partitioned node rejoins the cluster by using a two phase election.
@@ -210,12 +212,13 @@ impl Default for Config {
         let split_size = ReadableSize::mb(coprocessor::config::SPLIT_SIZE_MB);
         Config {
             delay_sync_us: 0,
-            store_io_min_interval_us: 500,
+            store_io_min_interval_us: 300,
             store_io_pool_size: 2,
             store_io_queue_size: 64,
             store_io_queue_init_bytes: 256 * 1024,
-            store_io_queue_bytes_step: 1.5,
-            store_io_queue_sample_size: 1024,
+            store_io_queue_bytes_step: 1.414213562373095,
+            store_io_queue_adaptive_gain: 0,
+            store_io_queue_sample_quantile: 0.9,
             apply_io_size: 0,
             prevote: true,
             raftdb_path: String::new(),
@@ -458,8 +461,11 @@ impl Config {
             .with_label_values(&["store_io_queue_bytes_step"])
             .set((self.store_io_queue_bytes_step as f64).into());
         CONFIG_RAFTSTORE_GAUGE
-            .with_label_values(&["store_io_queue_sample_size"])
-            .set((self.store_io_queue_sample_size as i32).into());
+            .with_label_values(&["store_io_queue_sample_quantile"])
+            .set((self.store_io_queue_sample_quantile as i32).into());
+        CONFIG_RAFTSTORE_GAUGE
+            .with_label_values(&["store_io_queue_adaptive_gain"])
+            .set((self.store_io_queue_adaptive_gain as i32).into());
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["apply_io_size"])
             .set((self.apply_io_size as i32).into());

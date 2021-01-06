@@ -234,7 +234,12 @@ lazy_static! {
             "TODO",
             exponential_buckets(256.0, 2.0, 30).unwrap()
         ).unwrap();
-
+    pub static ref RAFT_ASYNC_WRITER_TASK_SUGGEST_BYTES: Histogram =
+        register_histogram!(
+            "tikv_raftstore_store_task_suggest_bytes",
+            "TODO",
+            exponential_buckets(256.0, 2.0, 30).unwrap()
+        ).unwrap();
 
     pub static ref PEER_PROPOSAL_COUNTER_VEC: IntCounterVec =
         register_int_counter_vec!(

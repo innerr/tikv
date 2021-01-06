@@ -393,25 +393,67 @@ where
 */
 
 pub struct SampleWindow {
-    que: VecDeque<f64>,
-    size: usize,
-    sum: f64,
+    count: usize,
+    buckets: VecDeque<f64>,
+    buckets_val_cnt: VecDeque<usize>,
+    bucket_factor: f64,
 }
 
 impl SampleWindow {
-    pub fn new(size: usize) -> SampleWindow {
-        SampleWindow { que: VecDeque::default(), size, sum: 0.0 }
+    pub fn new() -> SampleWindow {
+        SampleWindow {
+            count: 0,
+            buckets: VecDeque::default(),
+            buckets_val_cnt: VecDeque::default(),
+            bucket_factor: 2.0,
+        }
     }
 
-    pub fn observe_and_get_avg(&mut self, value: f64) -> f64 {
-        self.que.push_back(value);
-        if self.que.len() > self.size {
-            let old = self.que.pop_front().unwrap();
-            self.sum = self.sum + value - old;
+    pub fn observe(&mut self, value: f64) {
+        // For P99, P999
+        self.count += 1;
+        if self.buckets.is_empty() {
+            self.buckets.push_back(value);
+            self.buckets_val_cnt.push_back(0);
         } else {
-            self.sum += value;
+            let mut bucket_pos = self.buckets.len() / 2;
+            loop {
+                let bucket_val = self.buckets[bucket_pos];
+                if value < bucket_val {
+                    if bucket_pos == 0 {
+                        self.buckets.push_front(bucket_val / self.bucket_factor);
+                        self.buckets_val_cnt.push_front(0);
+                    } else {
+                        bucket_pos -= 1;
+                    }
+                    continue;
+                }
+                let bucket_val_ub = bucket_val * self.bucket_factor;
+                if value < bucket_val_ub {
+                    break;
+                }
+                if bucket_pos + 1 >= self.buckets.len() {
+                    self.buckets.push_back(bucket_val_ub);
+                    self.buckets_val_cnt.push_back(0);
+                }
+                bucket_pos += 1;
+            }
+            self.buckets_val_cnt[bucket_pos] += 1;
         }
-        self.sum / (self.que.len() as f64)
+    }
+
+    pub fn quantile(&mut self, quantile: f64) -> f64 {
+        let mut cnt_sum = 0;
+        let mut index = self.buckets_val_cnt.len() - 1;
+        let sum_target = (self.count as f64 * quantile) as usize;
+        for i in 0..self.buckets_val_cnt.len() {
+            cnt_sum += self.buckets_val_cnt[i];
+            if cnt_sum >= sum_target {
+                index = i;
+                break;
+            }
+        }
+        self.buckets[index] * self.bucket_factor
     }
 }
 
@@ -423,7 +465,9 @@ where
     size_limits: Vec<usize>,
     current_idx: usize,
     adaptive_idx: usize,
+    adaptive_gain: usize,
     sample_window: SampleWindow,
+    sample_quantile: f64,
 }
 
 // TODO: make sure the queue size is good when doing pop/front
@@ -436,7 +480,8 @@ where
         queue_size: usize,
         queue_init_bytes: usize,
         queue_bytes_step: f64,
-        queue_sample_size: usize,
+        queue_adaptive_gain: usize,
+        queue_sample_quantile: f64,
     ) -> AsyncWriterTasks<ER> {
         let mut wbs = VecDeque::default();
         for _ in 0..queue_size {
@@ -447,7 +492,7 @@ where
         }
         let mut size_limits = vec![];
         let mut size_limit = queue_init_bytes;
-        for _ in 0..(queue_size * 2) {
+        for _ in 0..(queue_size * 2 + queue_adaptive_gain) {
             size_limits.push(size_limit);
             size_limit = (size_limit as f64 * queue_bytes_step) as usize;
         }
@@ -456,7 +501,9 @@ where
             size_limits,
             current_idx: 0,
             adaptive_idx: 0,
-            sample_window: SampleWindow::new(queue_sample_size),
+            adaptive_gain: queue_adaptive_gain,
+            sample_window: SampleWindow::new(),
+            sample_quantile: queue_sample_quantile,
         }
     }
 
@@ -466,7 +513,8 @@ where
             assert!(self.wbs[self.current_idx + 1].is_empty());
         }
         let current_size = self.wbs[self.current_idx].wb.persist_size();
-        if current_size >= self.size_limits[self.adaptive_idx + self.current_idx] {
+        assert!(self.adaptive_gain + self.adaptive_idx + self.current_idx < self.size_limits.len());
+        if current_size >= self.size_limits[self.adaptive_gain + self.adaptive_idx + self.current_idx] {
             if self.current_idx + 1 < self.wbs.len() {
                 self.current_idx += 1;
                 assert!(self.wbs[self.current_idx].is_empty());
@@ -502,15 +550,21 @@ where
         let task_bytes = task.wb.persist_size();
         RAFT_ASYNC_WRITER_TASK_BYTES.observe(task_bytes as f64);
 
-        let task_avg_bytes = self.sample_window.observe_and_get_avg(task_bytes as f64);
-        let target_bytes = self.size_limits[self.adaptive_idx + self.current_idx] as f64;
-        RAFT_ASYNC_WRITER_TASK_LIMIT_BYTES.observe(target_bytes);
-        if task_avg_bytes >= target_bytes {
+        assert!(self.adaptive_gain + self.adaptive_idx + self.current_idx < self.size_limits.len());
+        RAFT_ASYNC_WRITER_TASK_LIMIT_BYTES.observe(
+            self.size_limits[self.adaptive_gain + self.adaptive_idx + self.current_idx] as f64);
+
+        self.sample_window.observe(task_bytes as f64);
+        let task_suggest_bytes = self.sample_window.quantile(self.sample_quantile);
+        RAFT_ASYNC_WRITER_TASK_SUGGEST_BYTES.observe(task_suggest_bytes);
+
+        let current_target_bytes = self.size_limits[self.adaptive_idx + self.current_idx] as f64;
+        if task_suggest_bytes >= current_target_bytes {
             if self.adaptive_idx + (self.wbs.len() - 1) + 1 < self.size_limits.len() {
                 self.adaptive_idx += 1;
             }
         } else if self.adaptive_idx > 0 &&
-            task_avg_bytes < (self.size_limits[self.adaptive_idx + self.current_idx - 1] as f64) {
+            task_suggest_bytes < (self.size_limits[self.adaptive_idx + self.current_idx - 1] as f64) {
             self.adaptive_idx -= 1;
         }
 

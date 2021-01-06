@@ -1415,10 +1415,11 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
         );
         let async_writer_tasks = AsyncWriterTasks::new(
             engines.raft.clone(),
-            (cfg.value().store_io_pool_size as usize) + 1,
+            (cfg.value().store_io_queue_size as usize) + 1,
             cfg.value().store_io_queue_init_bytes as usize,
             cfg.value().store_io_queue_bytes_step,
-            cfg.value().store_io_queue_sample_size as usize,
+            cfg.value().store_io_queue_adaptive_gain as usize,
+            cfg.value().store_io_queue_sample_quantile,
         );
         let async_writer = Arc::new(Mutex::new(AsyncWriter::new(
             engines.raft.clone(),
