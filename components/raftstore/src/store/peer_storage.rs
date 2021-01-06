@@ -396,12 +396,11 @@ pub struct SampleWindow {
     que: VecDeque<f64>,
     size: usize,
     sum: f64,
-    recal_counter: usize,
 }
 
 impl SampleWindow {
     pub fn new(size: usize) -> SampleWindow {
-        SampleWindow { que: VecDeque::default(), size, sum: 0.0, recal_counter: 0 }
+        SampleWindow { que: VecDeque::default(), size, sum: 0.0 }
     }
 
     pub fn observe_and_get_avg(&mut self, value: f64) -> f64 {
@@ -411,11 +410,6 @@ impl SampleWindow {
             self.sum = self.sum + value - old;
         } else {
             self.sum += value;
-        }
-        self.recal_counter += 1;
-        if self.recal_counter > self.size * 1000 {
-            self.recal_counter = 0;
-            self.sum = self.que.iter().sum();
         }
         self.sum / (self.que.len() as f64)
     }
