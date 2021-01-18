@@ -694,11 +694,11 @@ where
         let last_term = init_last_term(&engines, region, &raft_state, &apply_state)?;
         let applied_index_term = init_applied_index_term(&engines, region, &apply_state)?;
 
-        let cache = if engines.raft.has_builtin_entry_cache() {
+        /*let cache = if engines.raft.has_builtin_entry_cache() {
             None
         } else {
             Some(EntryCache::default())
-        };
+        };*/
 
         Ok(PeerStorage {
             engines,
@@ -713,7 +713,7 @@ where
             tag,
             applied_index_term,
             last_term,
-            cache,
+            cache: Some(EntryCache::default()),
         })
     }
 
@@ -1083,11 +1083,11 @@ where
     }
 
     pub fn maybe_gc_cache(&mut self, replicated_idx: u64, apply_idx: u64) {
-        if self.engines.raft.has_builtin_entry_cache() {
+        /*if self.engines.raft.has_builtin_entry_cache() {
             let rid = self.get_region_id();
             self.engines.raft.gc_entry_cache(rid, apply_idx + 1);
             return;
-        }
+        }*/
 
         let cache = self.cache.as_mut().unwrap();
         if replicated_idx == apply_idx {
@@ -1193,9 +1193,10 @@ where
     ) -> Result<()> {
         let region_id = self.get_region_id();
         clear_meta(&self.engines, kv_wb, raft_wb, region_id, &self.raft_state)?;
-        if !self.engines.raft.has_builtin_entry_cache() {
+        /*if !self.engines.raft.has_builtin_entry_cache() {
             self.cache = Some(EntryCache::default());
-        }
+        }*/
+        self.cache = Some(EntryCache::default());
         Ok(())
     }
 
