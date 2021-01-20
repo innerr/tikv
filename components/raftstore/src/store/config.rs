@@ -34,11 +34,9 @@ pub struct Config {
     #[config(skip)]
     pub store_io_queue_init_bytes: u64,
     #[config(skip)]
-    pub store_io_queue_bytes_step: f64,
+    pub store_io_queue_step_rate: f64,
     #[config(skip)]
-    pub store_io_queue_sample_quantile: f64,
-    #[config(skip)]
-    pub store_io_queue_adaptive_gain: u64,
+    pub store_io_queue_sample_size: usize,
     #[config(skip)]
     pub apply_io_size: u64,
     // minimizes disruption when a partitioned node rejoins the cluster by using a two phase election.
@@ -208,10 +206,9 @@ impl Default for Config {
         Config {
             store_io_max_wait_us: 300,
             store_io_queue_size: 64,
-            store_io_queue_init_bytes: 256 * 1024,
-            store_io_queue_bytes_step: 1.414213562373095,
-            store_io_queue_adaptive_gain: 1,
-            store_io_queue_sample_quantile: 0.99,
+            store_io_queue_init_bytes: 128 * 1024,
+            store_io_queue_step_rate: 1.414213562373095,
+            store_io_queue_sample_size: 128,
             apply_io_size: 0,
             prevote: true,
             raftdb_path: String::new(),
@@ -441,14 +438,11 @@ impl Config {
             .with_label_values(&["store_io_queue_init_bytes"])
             .set((self.store_io_queue_init_bytes as i32).into());
         CONFIG_RAFTSTORE_GAUGE
-            .with_label_values(&["store_io_queue_bytes_step"])
-            .set((self.store_io_queue_bytes_step as f64).into());
+            .with_label_values(&["store_io_queue_step_rate"])
+            .set((self.store_io_queue_step_rate as f64).into());
         CONFIG_RAFTSTORE_GAUGE
-            .with_label_values(&["store_io_queue_sample_quantile"])
-            .set((self.store_io_queue_sample_quantile as i32).into());
-        CONFIG_RAFTSTORE_GAUGE
-            .with_label_values(&["store_io_queue_adaptive_gain"])
-            .set((self.store_io_queue_adaptive_gain as i32).into());
+            .with_label_values(&["store_io_queue_sample_size"])
+            .set((self.store_io_queue_sample_size as i32).into());
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["apply_io_size"])
             .set((self.apply_io_size as i32).into());

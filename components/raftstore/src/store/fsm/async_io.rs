@@ -1,21 +1,22 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::collections::VecDeque;
-use std::mem;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Condvar};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use std::{cmp, mem};
 
 use crate::store::fsm::RaftRouter;
-use crate::store::metrics::*;
 use crate::store::local_metrics::AsyncWriterStoreMetrics;
+use crate::store::metrics::*;
 use crate::store::PeerMsg;
 use engine_traits::{KvEngine, RaftEngine, RaftLogBatch};
 use tikv_util::collections::HashMap;
 use tikv_util::time::{duration_to_sec, Instant};
 
 const RAFT_WB_SHRINK_SIZE: usize = 1024 * 1024;
+const RAFT_WB_PERSIST_SIZE_BASE: usize = 12;
 
 #[derive(Default)]
 pub struct UnsyncedReady {
@@ -53,12 +54,7 @@ impl SyncContext {
         }
     }
 
-    pub fn mark_ready_unsynced(
-        &mut self,
-        number: u64,
-        region_id: u64,
-        notifier: Arc<AtomicU64>,
-    ) {
+    pub fn mark_ready_unsynced(&mut self, number: u64, region_id: u64, notifier: Arc<AtomicU64>) {
         self.unsynced_readies
             .push_back(UnsyncedReady::new(number, region_id, notifier));
     }
@@ -99,10 +95,11 @@ where
     }
 
     pub fn is_empty(&self) -> bool {
-        self.unsynced_readies.is_empty()
+        self.unsynced_readies.is_empty() && self.wb.persist_size() <= RAFT_WB_PERSIST_SIZE_BASE
     }
 }
 
+/*
 pub struct SampleWindow {
     count: usize,
     buckets: VecDeque<f64>,
@@ -167,6 +164,201 @@ impl SampleWindow {
         self.buckets[index] * self.bucket_factor
     }
 }
+*/
+
+struct AsyncWriterIOSample {
+    task_bytes: usize,
+    elapsed_sec: f64,
+}
+
+struct AsyncWriterIOSamples {
+    low_bound: usize,
+    up_bound: usize,
+    samples: VecDeque<AsyncWriterIOSample>,
+    sample_size: usize,
+    sum_bytes: usize,
+    sum_secs: f64,
+}
+
+impl AsyncWriterIOSamples {
+    fn new(low_bound: usize, up_bound: usize, sample_size: usize) -> Self {
+        Self {
+            low_bound,
+            up_bound,
+            samples: VecDeque::default(),
+            sample_size,
+            sum_bytes: 0,
+            sum_secs: 0.0,
+        }
+    }
+
+    fn observe(&mut self, task_bytes: usize, elapsed_sec: f64) {
+        self.samples.push_back(AsyncWriterIOSample {
+            task_bytes,
+            elapsed_sec,
+        });
+        self.sum_bytes += task_bytes;
+        self.sum_secs += elapsed_sec;
+        if self.samples.len() > self.sample_size {
+            let dumping = self.samples.pop_front().unwrap();
+            self.sum_bytes -= dumping.task_bytes;
+            self.sum_secs -= dumping.elapsed_sec;
+        }
+    }
+
+    fn io_efficiency(&mut self) -> Option<f64> {
+        if self.samples.len() < cmp::max(1, self.sample_size / 2) {
+            None
+        } else {
+            Some(self.sum_bytes as f64 / self.sum_secs)
+        }
+    }
+}
+
+struct AsyncWriterIOLimiter {
+    init_bytes: usize,
+    step_rate: f64,
+    sample_size: usize,
+    limits: VecDeque<AsyncWriterIOSamples>,
+    origin_idx: i64,
+    adaptive_idx: i64,
+}
+
+impl AsyncWriterIOLimiter {
+    fn new(init_bytes: usize, step_rate: f64, sample_size: usize, queue_size: usize) -> Self {
+        let mut limits = VecDeque::default();
+        let mut low_bound = init_bytes;
+        for _ in 0..(queue_size * 2) {
+            let next_bytes = (low_bound as f64 * step_rate) as usize;
+            limits.push_back(AsyncWriterIOSamples::new(
+                low_bound,
+                next_bytes,
+                sample_size,
+            ));
+            low_bound = next_bytes;
+        }
+
+        let mut origin_idx: i64 = 0;
+        let mut up_bound = init_bytes;
+        loop {
+            if up_bound <= 4 * 1024 {
+                break;
+            }
+            let prev_bytes = (up_bound as f64 / step_rate) as usize;
+            limits.push_front(AsyncWriterIOSamples::new(prev_bytes, up_bound, sample_size));
+            up_bound = prev_bytes;
+            origin_idx += 1;
+        }
+        Self {
+            init_bytes,
+            step_rate,
+            sample_size,
+            limits,
+            origin_idx,
+            adaptive_idx: 0,
+        }
+    }
+
+    fn current_limit_bytes(&self, task_idx_in_queue: usize) -> usize {
+        let mut idx = (self.origin_idx + self.adaptive_idx + task_idx_in_queue as i64) as usize;
+        idx = cmp::min(idx, self.limits.len() - 2);
+        self.limits[idx + 1].up_bound
+    }
+
+    fn current_suggest_bytes(&self, task_idx_in_queue: usize) -> usize {
+        let mut idx = (self.origin_idx + self.adaptive_idx + task_idx_in_queue as i64) as usize;
+        idx = cmp::min(idx, self.limits.len() - 1);
+        self.limits[idx].up_bound
+    }
+
+    fn find_idx(&mut self, task_bytes: usize) -> usize {
+        let mut idx: usize = (self.origin_idx + self.adaptive_idx) as usize;
+        loop {
+            let (low_bound, up_bound) = {
+                let it = &self.limits[idx];
+                (it.low_bound, it.up_bound)
+            };
+            if task_bytes <= low_bound {
+                if idx > 0 {
+                    idx -= 1;
+                    continue;
+                }
+            } else if task_bytes > up_bound {
+                if idx + 1 < self.limits.len() {
+                    idx += 1;
+                    continue;
+                }
+            }
+            break;
+        }
+        idx
+    }
+
+    fn observe_finished_task(
+        &mut self,
+        task_bytes: usize,
+        elapsed_sec: f64,
+        metrics: &mut AsyncWriterStoreMetrics,
+        _current_queue_size: usize,
+    ) {
+        let idx = self.find_idx(task_bytes);
+        self.limits[idx].observe(task_bytes, elapsed_sec);
+
+        let ioe_self = {
+            let ioe_self = self.limits[idx].io_efficiency();
+            if ioe_self.is_none() {
+                return;
+            }
+            ioe_self.unwrap()
+        };
+
+        if idx + 1 < self.limits.len()
+            && self.origin_idx + self.adaptive_idx + 1 < self.limits.len() as i64
+        {
+            let ioe_up = self.limits[idx + 1].io_efficiency();
+            if let Some(ioe_up) = ioe_up {
+                let up_trend = ioe_up / ioe_self;
+                if up_trend > self.step_rate {
+                    if idx > 0 {
+                        let ioe_down = self.limits[idx - 1].io_efficiency();
+                        if let Some(ioe_down) = ioe_down {
+                            let down_trend = ioe_self / ioe_down;
+                            if down_trend < self.step_rate && up_trend / down_trend < self.step_rate {
+                                // Tough call, give up
+                                return;
+                            }
+                        }
+                    }
+                    self.adaptive_idx += 1;
+                    metrics.adaptive_idx.observe(self.adaptive_idx as f64);
+                    return;
+                }
+            }
+        }
+
+        if idx > 0 && self.origin_idx + self.adaptive_idx - 1 >= 0 {
+            let ioe_down = self.limits[idx - 1].io_efficiency();
+            if let Some(ioe_down) = ioe_down {
+                let down_trend = ioe_self / ioe_down;
+                if down_trend < self.step_rate {
+                    if idx + 1 < self.limits.len() {
+                        let ioe_up = self.limits[idx + 1].io_efficiency();
+                        if let Some(ioe_up) = ioe_up {
+                            let up_trend = ioe_up / ioe_self;
+                            if up_trend > self.step_rate && up_trend / down_trend < self.step_rate {
+                                // Tough call, give up
+                                return;
+                            }
+                        }
+                    }
+                    self.adaptive_idx -= 1;
+                    metrics.adaptive_idx.observe(self.adaptive_idx as f64);
+                    return;
+                }
+            }
+        }
+    }
+}
 
 pub struct AsyncWriterAdaptiveTasks<ER>
 where
@@ -174,18 +366,11 @@ where
 {
     engine: ER,
     wbs: VecDeque<AsyncWriterTask<ER::LogBatch>>,
+    queue_size: usize,
     metrics: AsyncWriterStoreMetrics,
     data_arrive_event: Arc<Condvar>,
-    queue_size: usize,
-    queue_init_bytes: usize,
-    queue_bytes_step: f64,
-    size_limits: Vec<usize>,
+    size_limiter: AsyncWriterIOLimiter,
     current_idx: usize,
-    adaptive_idx: usize,
-    adaptive_gain: usize,
-    sample_window: SampleWindow,
-    sample_quantile: f64,
-    task_suggest_bytes_cache: usize,
 }
 
 impl<ER> AsyncWriterAdaptiveTasks<ER>
@@ -195,10 +380,9 @@ where
     pub fn new(
         engine: ER,
         queue_size: usize,
-        queue_init_bytes: usize,
-        queue_bytes_step: f64,
-        queue_adaptive_gain: usize,
-        queue_sample_quantile: f64,
+        size_limiter_init_bytes: usize,
+        size_limiter_step_rate: f64,
+        size_limiter_sample_size: usize,
     ) -> Self {
         let data_arrive_event = Arc::new(Condvar::new());
         let mut wbs = VecDeque::default();
@@ -209,27 +393,19 @@ where
                 notifier: data_arrive_event.clone(),
             });
         }
-        let mut size_limits = vec![];
-        let mut size_limit = queue_init_bytes;
-        for _ in 0..(queue_size * 2 + queue_adaptive_gain) {
-            size_limits.push(size_limit);
-            size_limit = (size_limit as f64 * queue_bytes_step) as usize;
-        }
         Self {
             engine,
             wbs,
+            queue_size,
             metrics: AsyncWriterStoreMetrics::default(),
             data_arrive_event,
-            queue_size,
-            queue_init_bytes,
-            queue_bytes_step,
-            size_limits,
+            size_limiter: AsyncWriterIOLimiter::new(
+                size_limiter_init_bytes,
+                size_limiter_step_rate,
+                size_limiter_sample_size,
+                queue_size,
+            ),
             current_idx: 0,
-            adaptive_idx: 0,
-            adaptive_gain: queue_adaptive_gain,
-            sample_window: SampleWindow::new(),
-            sample_quantile: queue_sample_quantile,
-            task_suggest_bytes_cache: 0,
         }
     }
 
@@ -237,22 +413,21 @@ where
         Self::new(
             self.engine.clone(),
             self.queue_size,
-            self.queue_init_bytes,
-            self.queue_bytes_step,
-            self.adaptive_gain,
-            self.sample_quantile,
+            self.size_limiter.init_bytes,
+            self.size_limiter.step_rate,
+            self.size_limiter.sample_size,
         )
     }
 
     pub fn prepare_current_for_write(&mut self) -> &mut AsyncWriterTask<ER::LogBatch> {
-        let current_size = self.wbs[self.current_idx].wb.persist_size();
-        if current_size
-            >= self.size_limits[self.adaptive_gain + self.adaptive_idx + self.current_idx]
-        {
+        let current_bytes = self.wbs[self.current_idx].wb.persist_size();
+        let limit_bytes = self.size_limiter.current_limit_bytes(self.current_idx);
+        self.metrics.task_limit_bytes.observe(limit_bytes as f64);
+        if current_bytes >= limit_bytes {
             if self.current_idx + 1 < self.wbs.len() {
                 self.current_idx += 1;
             } else {
-                // do nothing, adaptive IO size
+                // Already reach the limit size from config, do nothing, use adaptive IO size
             }
         }
         &mut self.wbs[self.current_idx]
@@ -263,47 +438,38 @@ where
     }
 
     pub fn have_big_enough_task(&self) -> bool {
-        self.task_suggest_bytes_cache == 0 || self.wbs.front().unwrap().wb.persist_size() >= self.task_suggest_bytes_cache
+        let task_suggest_bytes = self.size_limiter.current_suggest_bytes(0);
+        self.metrics
+            .task_suggest_bytes
+            .observe(task_suggest_bytes as f64);
+        let persist_bytes = self.wbs.front().unwrap().wb.persist_size();
+        persist_bytes >= task_suggest_bytes
     }
 
     pub fn detach_task(&mut self) -> AsyncWriterTask<ER::LogBatch> {
-        self.metrics.queue_size.observe(self.current_idx as f64);
-        self.metrics.adaptive_idx.observe(self.adaptive_idx as f64);
-
         let task = self.wbs.pop_front().unwrap();
-
-        let task_bytes = task.wb.persist_size();
-        self.metrics.task_real_bytes.observe(task_bytes as f64);
-
-        let limit_bytes = self.size_limits[self.adaptive_gain + self.adaptive_idx + self.current_idx];
-        self.metrics.task_limit_bytes.observe(limit_bytes as f64);
-
-        self.sample_window.observe(task_bytes as f64);
-        let task_suggest_bytes = self.sample_window.quantile(self.sample_quantile);
-        self.task_suggest_bytes_cache = task_suggest_bytes as usize;
-        self.metrics.task_suggest_bytes.observe(task_suggest_bytes);
-
-        let current_target_bytes = self.size_limits[self.adaptive_idx + self.current_idx] as f64;
-        if task_suggest_bytes >= current_target_bytes {
-            if self.adaptive_idx + (self.wbs.len() - 1) + 1 < self.size_limits.len() {
-                self.adaptive_idx += 1;
-            }
-        } else if self.adaptive_idx > 0
-            && task_suggest_bytes
-                < (self.size_limits[self.adaptive_idx + self.current_idx - 1] as f64)
-        {
-            self.adaptive_idx -= 1;
-        }
-
-        if self.current_idx != 0 {
+        if self.current_idx > 0 {
             self.current_idx -= 1;
         }
         task
     }
 
-    pub fn push_back_done_task(&mut self, mut task: AsyncWriterTask<ER::LogBatch>) {
+    pub fn finish_task(
+        &mut self,
+        mut task: AsyncWriterTask<ER::LogBatch>,
+        task_bytes: usize,
+        elapsed_sec: f64,
+    ) {
         task.unsynced_readies.clear();
         self.wbs.push_back(task);
+        self.metrics.queue_size.observe(self.current_idx as f64);
+        self.metrics.task_real_bytes.observe(task_bytes as f64);
+        self.size_limiter.observe_finished_task(
+            task_bytes,
+            elapsed_sec,
+            &mut self.metrics,
+            self.current_idx,
+        );
     }
 
     pub fn flush_metrics(&mut self) {
@@ -376,7 +542,7 @@ where
 
     pub fn clone_new(&self, start: bool) -> Self {
         let tasks = self.tasks.lock().unwrap();
-        let new_tasks= tasks.clone_new();
+        let new_tasks = tasks.clone_new();
         let data_arrive_event = new_tasks.data_arrive_event.clone();
         let mut async_writer = AsyncWriter {
             engine: self.engine.clone(),
@@ -403,24 +569,26 @@ where
                     loop {
                         let mut task = {
                             let mut tasks = x.tasks.lock().unwrap();
-                            while tasks.no_task() ||
-                                (!tasks.have_big_enough_task() && now_ts.elapsed() < x.io_max_wait) {
+                            while tasks.no_task()
+                                || (!tasks.have_big_enough_task()
+                                    && now_ts.elapsed() < x.io_max_wait)
+                            {
                                 tasks = x.data_arrive_event.wait(tasks).unwrap();
                             }
                             tasks.detach_task()
                         };
 
-                        assert!(!task.is_empty());
+                        let task_bytes = task.wb.persist_size();
                         x.sync_write(&mut task.wb, &task.unsynced_readies);
 
-                        // TODO: block if too many tasks
+                        let elapsed_sec = duration_to_sec(now_ts.elapsed()) as f64;
+
                         {
                             let mut tasks = x.tasks.lock().unwrap();
-                            tasks.push_back_done_task(task);
+                            tasks.finish_task(task, task_bytes, elapsed_sec);
                         }
 
-                        STORE_WRITE_RAFTDB_TICK_DURATION_HISTOGRAM
-                            .observe(duration_to_sec(now_ts.elapsed()) as f64);
+                        STORE_WRITE_RAFTDB_TICK_DURATION_HISTOGRAM.observe(elapsed_sec);
                         now_ts = Instant::now_coarse();
                     }
                 })

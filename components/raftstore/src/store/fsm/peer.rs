@@ -913,16 +913,10 @@ where
         }
     }
 
-    pub fn post_raft_ready_append(
-        &mut self,
-        ready: Ready,
-        invoke_ctx: InvokeContext,
-    ) {
+    pub fn post_raft_ready_append(&mut self, ready: Ready, invoke_ctx: InvokeContext) {
         let is_merging = self.fsm.peer.pending_merge_state.is_some();
         let res = self.fsm.peer.post_raft_ready_append(self.ctx, invoke_ctx);
-        self.fsm
-            .peer
-            .handle_raft_ready_advance(self.ctx, ready);
+        self.fsm.peer.handle_raft_ready_advance(self.ctx, ready);
         if let Some(apply_res) = res {
             self.on_ready_apply_snapshot(apply_res);
             if is_merging {

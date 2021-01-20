@@ -32,8 +32,8 @@ use super::metrics::*;
 use super::worker::RegionTask;
 use super::{SnapEntry, SnapKey, SnapManager, SnapshotStatistics};
 
-use std::sync::atomic::AtomicU64;
 use crate::store::fsm::async_io::AsyncWriterTasks;
+use std::sync::atomic::AtomicU64;
 
 // When we create a region peer, we should initialize its log term/index > 0,
 // so that we can force the follower peer to sync the snapshot first.
