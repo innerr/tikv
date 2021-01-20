@@ -184,61 +184,61 @@ lazy_static! {
         register_histogram!(
             "tikv_raftstore_store_loop_duration_seconds",
             "TODO",
-            exponential_buckets(0.0005, 2.0, 20).unwrap()
+            exponential_buckets(0.0005, 1.4143, 40).unwrap()
         ).unwrap();
     pub static ref STORE_LOOP_WORK_DURATION_HISTOGRAM: Histogram =
         register_histogram!(
             "tikv_raftstore_store_loop_work_duration_seconds",
             "TODO",
-            exponential_buckets(0.0005, 2.0, 20).unwrap()
+            exponential_buckets(0.0005, 1.4143, 40).unwrap()
         ).unwrap();
     pub static ref STORE_WRITE_KVDB_DURATION_HISTOGRAM: Histogram =
         register_histogram!(
             "tikv_raftstore_store_write_kvdb_duration_seconds",
             "TODO",
-            exponential_buckets(0.0005, 2.0, 20).unwrap()
+            exponential_buckets(0.0005, 1.4143, 40).unwrap()
         ).unwrap();
     pub static ref STORE_WRITE_RAFTDB_TICK_DURATION_HISTOGRAM: Histogram =
         register_histogram!(
             "tikv_raftstore_store_write_raftdb_tick_duration_seconds",
             "TODO",
-            exponential_buckets(0.0005, 2.0, 20).unwrap()
+            exponential_buckets(0.0005, 1.4143, 40).unwrap()
         ).unwrap();
     pub static ref STORE_WRITE_RAFTDB_DURATION_HISTOGRAM: Histogram =
         register_histogram!(
             "tikv_raftstore_store_write_raftdb_duration_seconds",
             "TODO",
-            exponential_buckets(0.0005, 2.0, 20).unwrap()
+            exponential_buckets(0.0005, 1.4143, 40).unwrap()
         ).unwrap();
     pub static ref RAFT_ASYNC_WRITER_STORE_QUEUE_SIZE: Histogram =
         register_histogram!(
             "tikv_raftstore_store_write_queue_size",
             "TODO",
-            exponential_buckets(1.0, 2.0, 20).unwrap()
+            exponential_buckets(1.0, 1.414, 40).unwrap()
         ).unwrap();
     pub static ref RAFT_ASYNC_WRITER_STORE_ADAPTIVE_IDX: Histogram =
         register_histogram!(
             "tikv_raftstore_store_adaptive_idx",
             "TODO",
-            exponential_buckets(1.0, 2.0, 20).unwrap()
+            exponential_buckets(1.0, 1.4143, 40).unwrap()
         ).unwrap();
     pub static ref RAFT_ASYNC_WRITER_STORE_TASK_BYTES: Histogram =
         register_histogram!(
             "tikv_raftstore_store_task_bytes",
             "TODO",
-            exponential_buckets(256.0, 2.0, 30).unwrap()
+            exponential_buckets(64.0, 1.414, 64).unwrap()
         ).unwrap();
     pub static ref RAFT_ASYNC_WRITER_STORE_TASK_LIMIT_BYTES: Histogram =
         register_histogram!(
             "tikv_raftstore_store_task_limit_bytes",
             "TODO",
-            exponential_buckets(256.0, 2.0, 30).unwrap()
+            exponential_buckets(64.0, 1.414, 64).unwrap()
         ).unwrap();
     pub static ref RAFT_ASYNC_WRITER_STORE_TASK_SUGGEST_BYTES: Histogram =
         register_histogram!(
             "tikv_raftstore_store_task_suggest_bytes",
             "TODO",
-            exponential_buckets(256.0, 2.0, 30).unwrap()
+            exponential_buckets(64.0, 1.414, 64).unwrap()
         ).unwrap();
 
     pub static ref PEER_PROPOSAL_COUNTER_VEC: IntCounterVec =

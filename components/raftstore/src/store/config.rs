@@ -208,7 +208,7 @@ impl Default for Config {
             store_io_queue_size: 64,
             store_io_queue_init_bytes: 128 * 1024,
             store_io_queue_step_rate: 1.414213562373095,
-            store_io_queue_sample_size: 128,
+            store_io_queue_sample_size: 512,
             apply_io_size: 0,
             prevote: true,
             raftdb_path: String::new(),

@@ -18,6 +18,9 @@ use tikv_util::time::{duration_to_sec, Instant};
 const RAFT_WB_SHRINK_SIZE: usize = 1024 * 1024;
 const RAFT_WB_PERSIST_SIZE_BASE: usize = 12;
 
+const ADAPTIVE_LIMITER_BYTES_MIN: usize = 4 * 1024;
+//const ADAPTIVE_LIMITER_BYTES_MAX: usize = 32 * 1024 * 1024;
+
 #[derive(Default)]
 pub struct UnsyncedReady {
     pub number: u64,
@@ -206,7 +209,7 @@ impl AsyncWriterIOSamples {
         }
     }
 
-    fn io_efficiency(&mut self) -> Option<f64> {
+    fn io_efficiency(&mut self, i: usize) -> Option<f64> {
         if self.samples.len() < cmp::max(1, self.sample_size / 2) {
             None
         } else {
@@ -220,59 +223,49 @@ struct AsyncWriterIOLimiter {
     step_rate: f64,
     sample_size: usize,
     limits: VecDeque<AsyncWriterIOSamples>,
-    origin_idx: i64,
-    adaptive_idx: i64,
+    adaptive_idx: usize,
 }
 
 impl AsyncWriterIOLimiter {
     fn new(init_bytes: usize, step_rate: f64, sample_size: usize, queue_size: usize) -> Self {
         let mut limits = VecDeque::default();
-        let mut low_bound = init_bytes;
-        for _ in 0..(queue_size * 2) {
-            let next_bytes = (low_bound as f64 * step_rate) as usize;
+        let mut low_bound = ADAPTIVE_LIMITER_BYTES_MIN;
+        let mut adaptive_idx: usize = 0;
+        for i in 0..(queue_size * 2) {
+            let up_bound = (low_bound as f64 * step_rate) as usize;
             limits.push_back(AsyncWriterIOSamples::new(
                 low_bound,
-                next_bytes,
+                up_bound,
                 sample_size,
             ));
-            low_bound = next_bytes;
-        }
-
-        let mut origin_idx: i64 = 0;
-        let mut up_bound = init_bytes;
-        loop {
-            if up_bound <= 4 * 1024 {
-                break;
+            if init_bytes > low_bound && init_bytes <= up_bound {
+                adaptive_idx = i;
             }
-            let prev_bytes = (up_bound as f64 / step_rate) as usize;
-            limits.push_front(AsyncWriterIOSamples::new(prev_bytes, up_bound, sample_size));
-            up_bound = prev_bytes;
-            origin_idx += 1;
+            low_bound = up_bound;
         }
         Self {
             init_bytes,
             step_rate,
             sample_size,
             limits,
-            origin_idx,
-            adaptive_idx: 0,
+            adaptive_idx,
         }
     }
 
     fn current_limit_bytes(&self, task_idx_in_queue: usize) -> usize {
-        let mut idx = (self.origin_idx + self.adaptive_idx + task_idx_in_queue as i64) as usize;
+        let mut idx = self.adaptive_idx + task_idx_in_queue;
         idx = cmp::min(idx, self.limits.len() - 2);
         self.limits[idx + 1].up_bound
     }
 
     fn current_suggest_bytes(&self, task_idx_in_queue: usize) -> usize {
-        let mut idx = (self.origin_idx + self.adaptive_idx + task_idx_in_queue as i64) as usize;
+        let mut idx = self.adaptive_idx + task_idx_in_queue;
         idx = cmp::min(idx, self.limits.len() - 1);
         self.limits[idx].up_bound
     }
 
     fn find_idx(&mut self, task_bytes: usize) -> usize {
-        let mut idx: usize = (self.origin_idx + self.adaptive_idx) as usize;
+        let mut idx = self.adaptive_idx;
         loop {
             let (low_bound, up_bound) = {
                 let it = &self.limits[idx];
@@ -305,22 +298,20 @@ impl AsyncWriterIOLimiter {
         self.limits[idx].observe(task_bytes, elapsed_sec);
 
         let ioe_self = {
-            let ioe_self = self.limits[idx].io_efficiency();
+            let ioe_self = self.limits[idx].io_efficiency(idx);
             if ioe_self.is_none() {
                 return;
             }
             ioe_self.unwrap()
         };
 
-        if idx + 1 < self.limits.len()
-            && self.origin_idx + self.adaptive_idx + 1 < self.limits.len() as i64
-        {
-            let ioe_up = self.limits[idx + 1].io_efficiency();
+        if idx + 1 < self.limits.len() && self.adaptive_idx + 1 < self.limits.len() {
+            let ioe_up = self.limits[idx + 1].io_efficiency(idx+1);
             if let Some(ioe_up) = ioe_up {
                 let up_trend = ioe_up / ioe_self;
                 if up_trend > self.step_rate {
                     if idx > 0 {
-                        let ioe_down = self.limits[idx - 1].io_efficiency();
+                        let ioe_down = self.limits[idx - 1].io_efficiency(idx-1);
                         if let Some(ioe_down) = ioe_down {
                             let down_trend = ioe_self / ioe_down;
                             if down_trend < self.step_rate && up_trend / down_trend < self.step_rate {
@@ -329,6 +320,12 @@ impl AsyncWriterIOLimiter {
                             }
                         }
                     }
+                    warn!(
+                        "limiter adaptive-idx up";
+                        "up-trend" => up_trend,
+                        "calculate-idx" => idx,
+                        "adaptive-idx" => self.adaptive_idx,
+                    );
                     self.adaptive_idx += 1;
                     metrics.adaptive_idx.observe(self.adaptive_idx as f64);
                     return;
@@ -336,21 +333,27 @@ impl AsyncWriterIOLimiter {
             }
         }
 
-        if idx > 0 && self.origin_idx + self.adaptive_idx - 1 >= 0 {
-            let ioe_down = self.limits[idx - 1].io_efficiency();
+        if idx > 0 && self.adaptive_idx > 0 {
+            let ioe_down = self.limits[idx - 1].io_efficiency(idx-1);
             if let Some(ioe_down) = ioe_down {
                 let down_trend = ioe_self / ioe_down;
                 if down_trend < self.step_rate {
                     if idx + 1 < self.limits.len() {
-                        let ioe_up = self.limits[idx + 1].io_efficiency();
+                        let ioe_up = self.limits[idx + 1].io_efficiency(idx+1);
                         if let Some(ioe_up) = ioe_up {
                             let up_trend = ioe_up / ioe_self;
-                            if up_trend > self.step_rate && up_trend / down_trend < self.step_rate {
+                            if up_trend > self.step_rate && up_trend / down_trend > self.step_rate {
                                 // Tough call, give up
                                 return;
                             }
                         }
                     }
+                    warn!(
+                        "limiter adaptive-idx down";
+                        "donw-trend" => down_trend,
+                        "calculate-idx" => idx,
+                        "adaptive-idx" => self.adaptive_idx,
+                    );
                     self.adaptive_idx -= 1;
                     metrics.adaptive_idx.observe(self.adaptive_idx as f64);
                     return;
