@@ -196,6 +196,7 @@ impl EntryCache {
             }
         }
         let mut start_idx = 0;
+        /*
         if let Some(len) = (self.cache.len() + entries.len()).checked_sub(MAX_CACHE_CAPACITY) {
             if len < self.cache.len() {
                 let mut drained_cache_entries_size = 0;
@@ -209,6 +210,7 @@ impl EntryCache {
                 self.cache.clear();
             }
         }
+        */
         let old_capacity = self.cache.capacity();
         let mut entries_mem_size = 0;
         for e in &entries[start_idx..] {
