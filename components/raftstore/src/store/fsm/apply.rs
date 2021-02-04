@@ -42,7 +42,7 @@ use tikv_util::config::{Tracker, VersionTrack};
 use tikv_util::mpsc::{loose_bounded, LooseBoundedSender, Receiver};
 use tikv_util::time::{duration_to_sec, Instant};
 use tikv_util::worker::Scheduler;
-use tikv_util::{Either, MustConsumeVec};
+use tikv_util::Either;
 use time::Timespec;
 use uuid::Builder as UuidBuilder;
 
@@ -63,8 +63,12 @@ use crate::{observe_perf_context_type, report_perf_context, Error, Result};
 
 use super::metrics::*;
 
-const DEFAULT_APPLY_WB_SIZE: usize = 4 * 1024;
-const APPLY_WB_SHRINK_SIZE: usize = 1024 * 1024;
+use std::mem;
+use crate::store::fsm::async_io::ApplyAsyncWriterTasks;
+use crate::store::fsm::async_io::ApplyAsyncWriter;
+
+//const DEFAULT_APPLY_WB_SIZE: usize = 4 * 1024;
+//const APPLY_WB_SHRINK_SIZE: usize = 1024 * 1024;
 const SHRINK_PENDING_CMD_QUEUE_CAP: usize = 64;
 
 pub struct PendingCmd<S>
@@ -283,7 +287,7 @@ impl ExecContext {
     }
 }
 
-struct ApplyCallback<EK>
+pub struct ApplyCallback<EK>
 where
     EK: KvEngine,
 {
@@ -300,7 +304,7 @@ where
         ApplyCallback { region, cbs }
     }
 
-    fn invoke_all(self, host: &CoprocessorHost<EK>) {
+    pub fn invoke_all(self, host: &CoprocessorHost<EK>) {
         for (cb, mut cmd) in self.cbs {
             host.post_apply(&self.region, &mut cmd);
             if let Some(cb) = cb {
@@ -320,7 +324,7 @@ pub trait Notifier<EK: KvEngine>: Send {
     fn clone_box(&self) -> Box<dyn Notifier<EK>>;
 }
 
-struct ApplyContext<EK, W>
+struct ApplyContext<EK, W: 'static>
 where
     EK: KvEngine,
     W: WriteBatch<EK>,
@@ -333,11 +337,12 @@ where
     router: ApplyRouter<EK>,
     notifier: Box<dyn Notifier<EK>>,
     engine: EK,
-    cbs: MustConsumeVec<ApplyCallback<EK>>,
+    cbs: Vec<ApplyCallback<EK>>,
     apply_res: Vec<ApplyRes<EK::Snapshot>>,
     exec_ctx: Option<ExecContext>,
 
-    kv_wb: W,
+    //kv_wb: W,
+    _phantom: PhantomData<W>,
     kv_wb_last_bytes: u64,
     kv_wb_last_keys: u64,
 
@@ -358,9 +363,11 @@ where
     /// Used for handling race between splitting and creating new peer.
     /// An uninitialized peer can be replaced to the one from splitting iff they are exactly the same peer.
     pending_create_peers: Arc<Mutex<HashMap<u64, (u64, bool)>>>,
+
+    async_writer: ApplyAsyncWriter<EK, W>,
 }
 
-impl<EK, W> ApplyContext<EK, W>
+impl<EK, W: 'static> ApplyContext<EK, W>
 where
     EK: KvEngine,
     W: WriteBatch<EK>,
@@ -379,8 +386,25 @@ where
     ) -> ApplyContext<EK, W> {
         // If `enable_multi_batch_write` was set true, we create `RocksWriteBatchVec`.
         // Otherwise create `RocksWriteBatch`.
-        let kv_wb = W::with_capacity(&engine, DEFAULT_APPLY_WB_SIZE);
+        //let kv_wb = W::with_capacity(&engine, DEFAULT_APPLY_WB_SIZE);
 
+        let async_writer_tasks = ApplyAsyncWriterTasks::new(
+            engine.clone(),
+            (cfg.store_io_queue_size as usize) + 1,
+            cfg.store_io_queue_init_bytes as usize,
+            cfg.store_io_queue_bytes_step,
+            cfg.store_io_queue_adaptive_gain as usize,
+            cfg.store_io_queue_sample_quantile,
+        );
+        let async_writer = ApplyAsyncWriter::new(
+            engine.clone(),
+            notifier.clone_box(),
+            host.clone(),
+            "raftstore-apply-async-writer".to_string(),
+            cfg.store_io_max_wait_us,
+            async_writer_tasks,
+            true,
+        );
         ApplyContext {
             tag,
             timer: None,
@@ -390,8 +414,9 @@ where
             engine,
             router,
             notifier,
-            kv_wb,
-            cbs: MustConsumeVec::new("callback of apply context"),
+            //kv_wb,
+            _phantom: PhantomData,
+            cbs: vec![],
             apply_res: vec![],
             kv_wb_last_bytes: 0,
             kv_wb_last_keys: 0,
@@ -404,7 +429,20 @@ where
             yield_duration: cfg.apply_yield_duration.0,
             store_id,
             pending_create_peers,
+            async_writer,
         }
+    }
+
+    pub fn detach_cbs(&mut self) -> Vec<ApplyCallback<EK>> {
+        let mut cbs = vec![];//MustConsumeVec::new("callback of apply context");
+        mem::swap(&mut self.cbs, &mut cbs);
+        cbs
+    }
+
+    pub fn detach_apply_res(&mut self) -> Vec<ApplyRes<EK::Snapshot>> {
+        let mut apply_res = vec![];
+        mem::swap(&mut self.apply_res, &mut apply_res);
+        apply_res
     }
 
     /// Prepares for applying entries for `delegate`.
@@ -434,7 +472,10 @@ where
     /// This call is valid only when it's between a `prepare_for` and `finish_for`.
     pub fn commit(&mut self, delegate: &mut ApplyDelegate<EK>) {
         if self.last_applied_index < delegate.apply_state.get_applied_index() {
-            delegate.write_apply_state(self.kv_wb_mut());
+            let kv_wb_pool = self.async_writer.kv_wb_pool();
+            let mut wbs = kv_wb_pool.lock().unwrap();
+            let wb = &mut wbs.current_mut().wb;
+            delegate.write_apply_state(wb);
         }
         // last_applied_index doesn't need to be updated, set persistent to true will
         // force it call `prepare_for` automatically.
@@ -447,22 +488,38 @@ where
             self.write_to_db();
             self.prepare_for(delegate);
         }
-        self.kv_wb_last_bytes = self.kv_wb().data_size() as u64;
-        self.kv_wb_last_keys = self.kv_wb().count() as u64;
+        self.update_kv_wb_size();
     }
 
     /// Writes all the changes into RocksDB.
     /// If it returns true, all pending writes are persisted in engines.
     pub fn write_to_db(&mut self) -> bool {
+        // NOTE: delayed
+        report_perf_context!(
+            self.perf_context_statistics,
+            APPLY_PERF_CONTEXT_TIME_HISTOGRAM_STATIC
+        );
+
         let need_sync = self.sync_log_hint;
-        if !self.kv_wb_mut().is_empty() {
-            let mut write_opts = engine_traits::WriteOptions::new();
-            write_opts.set_sync(need_sync);
-            self.kv_wb()
-                .write_to_engine(&self.engine, &write_opts)
-                .unwrap_or_else(|e| {
-                    panic!("failed to write to engine: {:?}", e);
-                });
+        self.sync_log_hint = false;
+        let cbs = self.detach_cbs();
+        let apply_res = self.detach_apply_res();
+        self.async_writer.write_to_engine(need_sync, cbs, apply_res);
+        self.kv_wb_last_bytes = 0;
+        self.kv_wb_last_keys = 0;
+        false
+
+        // XX TODO
+        /*let need_sync = self.sync_log_hint;
+        if !self.kv_wb_is_empty() {
+            //let mut write_opts = engine_traits::WriteOptions::new();
+            //write_opts.set_sync(need_sync);
+            //self.kv_wb()
+            //    .write_to_engine(&self.engine, &write_opts)
+            //    .unwrap_or_else(|e| {
+            //        panic!("failed to write to engine: {:?}", e);
+            //    });
+            self.asynw_writer.sync_write(self.kv_wb(), need_sync);
             report_perf_context!(
                 self.perf_context_statistics,
                 APPLY_PERF_CONTEXT_TIME_HISTOGRAM_STATIC
@@ -487,6 +544,7 @@ where
             cbs.invoke_all(&self.host);
         }
         need_sync
+        */
     }
 
     /// Finishes `Apply`s for the delegate.
@@ -496,7 +554,10 @@ where
         results: VecDeque<ExecResult<EK::Snapshot>>,
     ) {
         if !delegate.pending_remove {
-            delegate.write_apply_state(self.kv_wb_mut());
+            let kv_wb_pool = self.async_writer.kv_wb_pool();
+            let mut wbs = kv_wb_pool.lock().unwrap();
+            let wb = &mut wbs.current_mut().wb;
+            delegate.write_apply_state(wb);
         }
         self.commit_opt(delegate, false);
         self.apply_res.push(ApplyRes {
@@ -509,13 +570,26 @@ where
     }
 
     pub fn delta_bytes(&self) -> u64 {
-        self.kv_wb().data_size() as u64 - self.kv_wb_last_bytes
+        let kv_wb_pool = self.async_writer.kv_wb_pool();
+        let wbs = kv_wb_pool.lock().unwrap();
+        let wb = &wbs.current().wb;
+        wb.data_size() as u64 - self.kv_wb_last_bytes
     }
 
     pub fn delta_keys(&self) -> u64 {
-        self.kv_wb().count() as u64 - self.kv_wb_last_keys
+        let kv_wb_pool = self.async_writer.kv_wb_pool();
+        let wbs = kv_wb_pool.lock().unwrap();
+        let wb = &wbs.current().wb;
+        wb.count() as u64 - self.kv_wb_last_keys
     }
 
+
+    #[inline]
+    pub fn kv_wb_pool(&mut self) -> Arc<Mutex<ApplyAsyncWriterTasks<EK, W>>> {
+        self.async_writer.kv_wb_pool()
+    }
+
+    /*
     #[inline]
     pub fn kv_wb(&self) -> &W {
         &self.kv_wb
@@ -524,6 +598,26 @@ where
     #[inline]
     pub fn kv_wb_mut(&mut self) -> &mut W {
         &mut self.kv_wb
+    }
+    */
+
+    pub fn kv_wb_key_count(&self) -> u64 {
+        let kv_wb_pool = self.async_writer.kv_wb_pool();
+        let wbs = kv_wb_pool.lock().unwrap();
+        let wb = &wbs.current().wb;
+        wb.count() as u64
+    }
+
+    pub fn update_kv_wb_size(&mut self) {
+        let kv_wb_pool = self.async_writer.kv_wb_pool();
+        let wbs = kv_wb_pool.lock().unwrap();
+        let wb = &wbs.current().wb;
+        self.kv_wb_last_bytes = wb.data_size() as u64;
+        self.kv_wb_last_keys = wb.count() as u64;
+    }
+
+    pub fn should_write_to_engine(&self) -> bool {
+        self.async_writer.should_write_to_engine()
     }
 
     /// Flush all pending writes to engines.
@@ -542,10 +636,12 @@ where
         // so we use sync-log flag here.
         let is_synced = self.write_to_db();
 
+        /*
         if !self.apply_res.is_empty() {
             let apply_res = std::mem::replace(&mut self.apply_res, vec![]);
             self.notifier.notify(apply_res);
         }
+        */
 
         let elapsed = t.elapsed();
         STORE_APPLY_LOG_HISTOGRAM.observe(duration_to_sec(elapsed) as f64);
@@ -770,7 +866,7 @@ where
     /// The term of the raft log at applied index.
     applied_index_term: u64,
     /// The latest synced apply index.
-    last_sync_apply_index: u64,
+    //last_sync_apply_index: u64,
 
     /// Info about cmd observer.
     observe_cmd: Option<ObserveCmd>,
@@ -789,7 +885,7 @@ where
             tag: format!("[region {}] {}", reg.region.get_id(), reg.id),
             region: reg.region,
             pending_remove: false,
-            last_sync_apply_index: reg.apply_state.get_applied_index(),
+            //last_sync_apply_index: reg.apply_state.get_applied_index(),
             apply_state: reg.apply_state,
             applied_index_term: reg.applied_index_term,
             term: reg.term,
@@ -922,7 +1018,8 @@ where
         if !data.is_empty() {
             let cmd = util::parse_data_at(data, index, &self.tag);
 
-            if should_write_to_engine(&cmd) || apply_ctx.kv_wb().should_write_to_engine() {
+            if should_write_to_engine(&cmd) || apply_ctx.should_write_to_engine() {
+            //if apply_ctx.should_write_to_engine() {
                 apply_ctx.commit(self);
                 if let Some(start) = self.handle_start.as_ref() {
                     if start.elapsed() >= apply_ctx.yield_duration {
@@ -1098,35 +1195,42 @@ where
         assert!(!self.pending_remove);
 
         ctx.exec_ctx = Some(self.new_ctx(index, term));
-        ctx.kv_wb_mut().set_save_point();
-        let mut origin_epoch = None;
-        let (resp, exec_result) = match self.exec_raft_cmd(ctx, &req) {
-            Ok(a) => {
-                ctx.kv_wb_mut().pop_save_point().unwrap();
-                if req.has_admin_request() {
-                    origin_epoch = Some(self.region.get_region_epoch().clone());
+        let (resp, exec_result, origin_epoch) = {
+            let kv_wb_pool = ctx.kv_wb_pool();
+            let mut wbs = kv_wb_pool.lock().unwrap();
+            let kv_wb_mut = &mut wbs.current_mut().wb;
+            kv_wb_mut.set_save_point();
+            let mut origin_epoch = None;
+            let (resp, exec_result) = match self.exec_raft_cmd(ctx, &req) {
+                Ok(a) => {
+                    kv_wb_mut.pop_save_point().unwrap();
+                    if req.has_admin_request() {
+                        origin_epoch = Some(self.region.get_region_epoch().clone());
+                    }
+                    a
                 }
-                a
-            }
-            Err(e) => {
-                // clear dirty values.
-                ctx.kv_wb_mut().rollback_to_save_point().unwrap();
-                match e {
-                    Error::EpochNotMatch(..) => debug!(
-                        "epoch not match";
-                        "region_id" => self.region_id(),
-                        "peer_id" => self.id(),
-                        "err" => ?e
-                    ),
-                    _ => error!(?e;
-                        "execute raft command";
-                        "region_id" => self.region_id(),
-                        "peer_id" => self.id(),
-                    ),
+                Err(e) => {
+                    // clear dirty values.
+                    kv_wb_mut.rollback_to_save_point().unwrap();
+                    match e {
+                        Error::EpochNotMatch(..) => debug!(
+                            "epoch not match";
+                            "region_id" => self.region_id(),
+                            "peer_id" => self.id(),
+                            "err" => ?e
+                        ),
+                        _ => error!(?e;
+                            "execute raft command";
+                            "region_id" => self.region_id(),
+                            "peer_id" => self.id(),
+                        ),
+                    }
+                    (cmd_resp::new_error(e), ApplyResult::None)
                 }
-                (cmd_resp::new_error(e), ApplyResult::None)
-            }
+            };
+            (resp, exec_result, origin_epoch)
         };
+
         if let ApplyResult::WaitMergeSource(_) = exec_result {
             return (resp, exec_result);
         }
@@ -1214,7 +1318,7 @@ where
     EK: KvEngine,
 {
     // Only errors that will also occur on all other stores should be returned.
-    fn exec_raft_cmd<W: WriteBatch<EK>>(
+    fn exec_raft_cmd<W: WriteBatch<EK> + 'static>(
         &mut self,
         ctx: &mut ApplyContext<EK, W>,
         req: &RaftCmdRequest,
@@ -1230,7 +1334,7 @@ where
         }
     }
 
-    fn exec_admin_cmd<W: WriteBatch<EK>>(
+    fn exec_admin_cmd<W: WriteBatch<EK> + 'static>(
         &mut self,
         ctx: &mut ApplyContext<EK, W>,
         req: &RaftCmdRequest,
@@ -1274,7 +1378,7 @@ where
         Ok((resp, exec_result))
     }
 
-    fn exec_write_cmd<W: WriteBatch<EK>>(
+    fn exec_write_cmd<W: WriteBatch<EK> + 'static>(
         &mut self,
         ctx: &mut ApplyContext<EK, W>,
         req: &RaftCmdRequest,
@@ -1295,8 +1399,18 @@ where
         for req in requests {
             let cmd_type = req.get_cmd_type();
             let mut resp = match cmd_type {
-                CmdType::Put => self.handle_put(ctx.kv_wb_mut(), req),
-                CmdType::Delete => self.handle_delete(ctx.kv_wb_mut(), req),
+                CmdType::Put => {
+                    let kv_wb_pool = ctx.kv_wb_pool();
+                    let mut wbs = kv_wb_pool.lock().unwrap();
+                    let wb = &mut wbs.current_mut().wb;
+                    self.handle_put(wb, req)
+                }
+                CmdType::Delete => {
+                    let kv_wb_pool = ctx.kv_wb_pool();
+                    let mut wbs = kv_wb_pool.lock().unwrap();
+                    let wb = &mut wbs.current_mut().wb;
+                    self.handle_delete(wb, req)
+                }
                 CmdType::DeleteRange => {
                     self.handle_delete_range(&ctx.engine, req, &mut ranges, ctx.use_delete_range)
                 }
@@ -1568,7 +1682,7 @@ impl<EK> ApplyDelegate<EK>
 where
     EK: KvEngine,
 {
-    fn exec_change_peer<W: WriteBatch<EK>>(
+    fn exec_change_peer<W: WriteBatch<EK> + 'static>(
         &mut self,
         ctx: &mut ApplyContext<EK, W>,
         request: &AdminRequest,
@@ -1750,8 +1864,14 @@ where
         } else {
             PeerState::Normal
         };
-        if let Err(e) = write_peer_state(ctx.kv_wb_mut(), &region, state, None) {
-            panic!("{} failed to update region state: {:?}", self.tag, e);
+
+        {
+            let kv_wb_pool = ctx.kv_wb_pool();
+            let mut wbs = kv_wb_pool.lock().unwrap();
+            let wb = &mut wbs.current_mut().wb;
+            if let Err(e) = write_peer_state(wb, &region, state, None) {
+                panic!("{} failed to update region state: {:?}", self.tag, e);
+            }
         }
 
         let mut resp = AdminResponse::default();
@@ -1768,7 +1888,7 @@ where
         ))
     }
 
-    fn exec_change_peer_v2<W: WriteBatch<EK>>(
+    fn exec_change_peer_v2<W: WriteBatch<EK> + 'static>(
         &mut self,
         ctx: &mut ApplyContext<EK, W>,
         request: &AdminRequest,
@@ -1795,8 +1915,13 @@ where
             PeerState::Normal
         };
 
-        if let Err(e) = write_peer_state(ctx.kv_wb_mut(), &region, state, None) {
-            panic!("{} failed to update region state: {:?}", self.tag, e);
+        {
+            let kv_wb_pool = ctx.kv_wb_pool();
+            let mut wbs = kv_wb_pool.lock().unwrap();
+            let wb = &mut wbs.current_mut().wb;
+            if let Err(e) = write_peer_state(wb, &region, state, None) {
+                panic!("{} failed to update region state: {:?}", self.tag, e);
+            }
         }
 
         let mut resp = AdminResponse::default();
@@ -1995,7 +2120,7 @@ where
         Ok(region)
     }
 
-    fn exec_split<W: WriteBatch<EK>>(
+    fn exec_split<W: WriteBatch<EK> + 'static>(
         &mut self,
         ctx: &mut ApplyContext<EK, W>,
         req: &AdminRequest,
@@ -2017,7 +2142,7 @@ where
         self.exec_batch_split(ctx, &admin_req)
     }
 
-    fn exec_batch_split<W: WriteBatch<EK>>(
+    fn exec_batch_split<W: WriteBatch<EK> + 'static>(
         &mut self,
         ctx: &mut ApplyContext<EK, W>,
         req: &AdminRequest,
@@ -2172,7 +2297,9 @@ where
             }
         }
 
-        let kv_wb_mut = ctx.kv_wb_mut();
+        let kv_wb_pool = ctx.kv_wb_pool();
+        let mut wbs = kv_wb_pool.lock().unwrap();
+        let kv_wb_mut = &mut wbs.current_mut().wb;
         for new_region in &regions {
             if new_region.get_id() == derived.get_id() {
                 continue;
@@ -2221,7 +2348,7 @@ where
         ))
     }
 
-    fn exec_prepare_merge<W: WriteBatch<EK>>(
+    fn exec_prepare_merge<W: WriteBatch<EK> + 'static>(
         &mut self,
         ctx: &mut ApplyContext<EK, W>,
         req: &AdminRequest,
@@ -2256,18 +2383,23 @@ where
         merging_state.set_min_index(index);
         merging_state.set_target(prepare_merge.get_target().to_owned());
         merging_state.set_commit(exec_ctx.index);
-        write_peer_state(
-            ctx.kv_wb_mut(),
-            &region,
-            PeerState::Merging,
-            Some(merging_state.clone()),
-        )
-        .unwrap_or_else(|e| {
-            panic!(
-                "{} failed to save merging state {:?} for region {:?}: {:?}",
-                self.tag, merging_state, region, e
+        {
+            let kv_wb_pool = ctx.kv_wb_pool();
+            let mut wbs = kv_wb_pool.lock().unwrap();
+            let wb = &mut wbs.current_mut().wb;
+            write_peer_state(
+                wb,
+                &region,
+                PeerState::Merging,
+                Some(merging_state.clone()),
             )
-        });
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{} failed to save merging state {:?} for region {:?}: {:?}",
+                    self.tag, merging_state, region, e
+                )
+            });
+        }
         fail_point!("apply_after_prepare_merge");
         PEER_ADMIN_CMD_COUNTER.prepare_merge.success.inc();
 
@@ -2292,7 +2424,7 @@ where
     // 7.   resume `exec_commit_merge` in target apply fsm
     // 8.   `on_ready_commit_merge` in target peer fsm and send `MergeResult` to source peer fsm
     // 9.   `on_merge_result` in source peer fsm (destroy itself)
-    fn exec_commit_merge<W: WriteBatch<EK>>(
+    fn exec_commit_merge<W: WriteBatch<EK> + 'static>(
         &mut self,
         ctx: &mut ApplyContext<EK, W>,
         req: &AdminRequest,
@@ -2393,7 +2525,9 @@ where
         } else {
             region.set_start_key(source_region.get_start_key().to_vec());
         }
-        let kv_wb_mut = ctx.kv_wb_mut();
+        let kv_wb_pool = ctx.kv_wb_pool();
+        let mut wbs = kv_wb_pool.lock().unwrap();
+        let kv_wb_mut = &mut wbs.current_mut().wb;
         write_peer_state(kv_wb_mut, &region, PeerState::Normal, None)
             .and_then(|_| {
                 // TODO: maybe all information needs to be filled?
@@ -2425,7 +2559,7 @@ where
         ))
     }
 
-    fn exec_rollback_merge<W: WriteBatch<EK>>(
+    fn exec_rollback_merge<W: WriteBatch<EK> + 'static>(
         &mut self,
         ctx: &mut ApplyContext<EK, W>,
         req: &AdminRequest,
@@ -2450,12 +2584,18 @@ where
         let version = region.get_region_epoch().get_version();
         // Update version to avoid duplicated rollback requests.
         region.mut_region_epoch().set_version(version + 1);
-        write_peer_state(ctx.kv_wb_mut(), &region, PeerState::Normal, None).unwrap_or_else(|e| {
-            panic!(
-                "{} failed to rollback merge {:?}: {:?}",
-                self.tag, rollback, e
-            )
-        });
+
+        {
+            let kv_wb_pool = ctx.kv_wb_pool();
+            let mut wbs = kv_wb_pool.lock().unwrap();
+            let wb = &mut wbs.current_mut().wb;
+            write_peer_state(wb, &region, PeerState::Normal, None).unwrap_or_else(|e| {
+                panic!(
+                    "{} failed to rollback merge {:?}: {:?}",
+                    self.tag, rollback, e
+                )
+            });
+        }
 
         PEER_ADMIN_CMD_COUNTER.rollback_merge.success.inc();
         let resp = AdminResponse::default();
@@ -2468,7 +2608,7 @@ where
         ))
     }
 
-    fn exec_compact_log<W: WriteBatch<EK>>(
+    fn exec_compact_log<W: WriteBatch<EK> + 'static>(
         &mut self,
         ctx: &mut ApplyContext<EK, W>,
         req: &AdminRequest,
@@ -2528,7 +2668,7 @@ where
         ))
     }
 
-    fn exec_compute_hash<W: WriteBatch<EK>>(
+    fn exec_compute_hash<W: WriteBatch<EK> + 'static>(
         &self,
         ctx: &ApplyContext<EK, W>,
         req: &AdminRequest,
@@ -2549,7 +2689,7 @@ where
         ))
     }
 
-    fn exec_verify_hash<W: WriteBatch<EK>>(
+    fn exec_verify_hash<W: WriteBatch<EK> + 'static>(
         &self,
         _: &ApplyContext<EK, W>,
         req: &AdminRequest,
@@ -3000,7 +3140,7 @@ where
     }
 
     /// Handles apply tasks, and uses the apply delegate to handle the committed entries.
-    fn handle_apply<W: WriteBatch<EK>>(
+    fn handle_apply<W: WriteBatch<EK> + 'static>(
         &mut self,
         apply_ctx: &mut ApplyContext<EK, W>,
         mut apply: Apply<EK::Snapshot>,
@@ -3074,8 +3214,9 @@ where
         APPLY_PROPOSAL.observe(propose_num as f64);
     }
 
-    fn destroy<W: WriteBatch<EK>>(&mut self, ctx: &mut ApplyContext<EK, W>) {
+    fn destroy<W: WriteBatch<EK> + 'static>(&mut self, ctx: &mut ApplyContext<EK, W>) {
         let region_id = self.delegate.region_id();
+        // XX TODO: force sync flush?
         if ctx.apply_res.iter().any(|res| res.region_id == region_id) {
             // Flush before destroying to avoid reordering messages.
             ctx.flush();
@@ -3094,7 +3235,7 @@ where
     }
 
     /// Handles peer destroy. When a peer is destroyed, the corresponding apply delegate should be removed too.
-    fn handle_destroy<W: WriteBatch<EK>>(&mut self, ctx: &mut ApplyContext<EK, W>, d: Destroy) {
+    fn handle_destroy<W: WriteBatch<EK> + 'static>(&mut self, ctx: &mut ApplyContext<EK, W>, d: Destroy) {
         assert_eq!(d.region_id, self.delegate.region_id());
         if d.merge_from_snapshot {
             assert_eq!(self.delegate.stopped, false);
@@ -3114,7 +3255,7 @@ where
         }
     }
 
-    fn resume_pending<W: WriteBatch<EK>>(&mut self, ctx: &mut ApplyContext<EK, W>) {
+    fn resume_pending<W: WriteBatch<EK> + 'static>(&mut self, ctx: &mut ApplyContext<EK, W>) {
         if let Some(ref state) = self.delegate.wait_merge_state {
             let source_region_id = state.logs_up_to_date.load(Ordering::SeqCst);
             if source_region_id == 0 {
@@ -3146,7 +3287,7 @@ where
         }
     }
 
-    fn logs_up_to_date_for_merge<W: WriteBatch<EK>>(
+    fn logs_up_to_date_for_merge<W: WriteBatch<EK> + 'static>(
         &mut self,
         ctx: &mut ApplyContext<EK, W>,
         catch_up_logs: CatchUpLogs,
@@ -3183,7 +3324,7 @@ where
     }
 
     #[allow(unused_mut)]
-    fn handle_snapshot<W: WriteBatch<EK>>(
+    fn handle_snapshot<W: WriteBatch<EK> + 'static>(
         &mut self,
         apply_ctx: &mut ApplyContext<EK, W>,
         snap_task: GenSnapTask,
@@ -3191,18 +3332,26 @@ where
         if self.delegate.pending_remove || self.delegate.stopped {
             return;
         }
+        /*
         let applied_index = self.delegate.apply_state.get_applied_index();
         let mut need_sync = apply_ctx
             .apply_res
             .iter()
             .any(|res| res.region_id == self.delegate.region_id())
             && self.delegate.last_sync_apply_index != applied_index;
+        */
+        let need_sync = true;
         (|| fail_point!("apply_on_handle_snapshot_sync", |_| { need_sync = true }))();
         if need_sync {
             if apply_ctx.timer.is_none() {
                 apply_ctx.timer = Some(Instant::now_coarse());
             }
-            self.delegate.write_apply_state(apply_ctx.kv_wb_mut());
+            {
+                let kv_wb_pool = apply_ctx.kv_wb_pool();
+                let mut wbs = kv_wb_pool.lock().unwrap();
+                let wb = &mut wbs.current_mut().wb;
+                self.delegate.write_apply_state(wb);
+            }
             fail_point!(
                 "apply_on_handle_snapshot_1_1",
                 self.delegate.id == 1 && self.delegate.region_id() == 1,
@@ -3212,7 +3361,7 @@ where
             apply_ctx.flush();
             // For now, it's more like last_flush_apply_index.
             // TODO: Update it only when `flush()` returns true.
-            self.delegate.last_sync_apply_index = applied_index;
+            //self.delegate.last_sync_apply_index = applied_index;
         }
 
         if let Err(e) = snap_task.generate_and_schedule_snapshot::<EK>(
@@ -3238,7 +3387,7 @@ where
         );
     }
 
-    fn handle_change<W: WriteBatch<EK>>(
+    fn handle_change<W: WriteBatch<EK> + 'static>(
         &mut self,
         apply_ctx: &mut ApplyContext<EK, W>,
         cmd: ChangeCmd,
@@ -3273,7 +3422,8 @@ where
         ) {
             Ok(()) => {
                 // Commit the writebatch for ensuring the following snapshot can get all previous writes.
-                if apply_ctx.kv_wb().count() > 0 {
+                let kv_wb_key_count = apply_ctx.kv_wb_key_count();
+                if kv_wb_key_count > 0 {
                     apply_ctx.commit(&mut self.delegate);
                 }
                 ReadResponse {
@@ -3317,7 +3467,7 @@ where
         cb.invoke_read(resp);
     }
 
-    fn handle_tasks<W: WriteBatch<EK>>(
+    fn handle_tasks<W: WriteBatch<EK> + 'static>(
         &mut self,
         apply_ctx: &mut ApplyContext<EK, W>,
         msgs: &mut Vec<Msg<EK>>,
@@ -3411,7 +3561,7 @@ impl Fsm for ControlFsm {
     }
 }
 
-pub struct ApplyPoller<EK, W>
+pub struct ApplyPoller<EK, W: 'static>
 where
     EK: KvEngine,
     W: WriteBatch<EK>,
@@ -3422,7 +3572,7 @@ where
     cfg_tracker: Tracker<Config>,
 }
 
-impl<EK, W> PollHandler<ApplyFsm<EK>, ControlFsm> for ApplyPoller<EK, W>
+impl<EK, W: 'static> PollHandler<ApplyFsm<EK>, ControlFsm> for ApplyPoller<EK, W>
 where
     EK: KvEngine,
     W: WriteBatch<EK>,
@@ -3506,13 +3656,16 @@ where
         expected_msg_count
     }
 
-    fn end(&mut self, fsms: &mut [Box<ApplyFsm<EK>>]) {
+    fn end(&mut self, _fsms: &mut [Box<ApplyFsm<EK>>]) {
+        self.apply_ctx.flush();
+        /*
         let is_synced = self.apply_ctx.flush();
         if is_synced {
             for fsm in fsms {
                 fsm.delegate.last_sync_apply_index = fsm.delegate.apply_state.get_applied_index();
             }
         }
+        */
     }
 }
 
@@ -3530,7 +3683,7 @@ pub struct Builder<EK: KvEngine, W: WriteBatch<EK>> {
     pending_create_peers: Arc<Mutex<HashMap<u64, (u64, bool)>>>,
 }
 
-impl<EK: KvEngine, W> Builder<EK, W>
+impl<EK: KvEngine, W: 'static> Builder<EK, W>
 where
     W: WriteBatch<EK>,
 {
@@ -3555,7 +3708,7 @@ where
     }
 }
 
-impl<EK, W> HandlerBuilder<ApplyFsm<EK>, ControlFsm> for Builder<EK, W>
+impl<EK, W: 'static> HandlerBuilder<ApplyFsm<EK>, ControlFsm> for Builder<EK, W>
 where
     EK: KvEngine,
     W: WriteBatch<EK>,
