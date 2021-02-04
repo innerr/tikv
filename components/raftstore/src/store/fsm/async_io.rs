@@ -2,8 +2,8 @@
 
 use std::collections::VecDeque;
 use std::mem;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Condvar};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -26,7 +26,7 @@ pub struct UnsyncedReady {
 }
 
 impl UnsyncedReady {
-    fn new(number: u64, region_id: u64, notifier: Arc<AtomicU64>) -> UnsyncedReady {
+    fn new(number: u64, region_id: u64, notifier: Arc<AtomicU64>) -> Self {
         UnsyncedReady {
             number,
             region_id,
@@ -112,8 +112,8 @@ pub struct SampleWindow {
 }
 
 impl SampleWindow {
-    pub fn new() -> SampleWindow {
-        SampleWindow {
+    pub fn new() -> Self {
+        Self {
             count: 0,
             buckets: VecDeque::default(),
             buckets_val_cnt: VecDeque::default(),
@@ -260,7 +260,7 @@ where
     }
 
     pub fn no_task(&self) -> bool {
-        self.wbs.front().unwrap().is_empty()
+        self.wbs.is_empty() || self.wbs.front().unwrap().is_empty()
     }
 
     pub fn have_big_enough_task(&self) -> bool {
@@ -334,7 +334,7 @@ where
     ER: RaftEngine,
 {
     fn clone(&self) -> Self {
-        AsyncWriter {
+        Self {
             engine: self.engine.clone(),
             router: self.router.clone(),
             tag: self.tag.clone(),
@@ -358,9 +358,9 @@ where
         io_max_wait_us: u64,
         tasks: AsyncWriterTasks<ER>,
         start: bool,
-    ) -> AsyncWriter<EK, ER> {
+    ) -> Self {
         let data_arrive_event = tasks.data_arrive_event.clone();
-        let mut async_writer = AsyncWriter {
+        let mut async_writer = Self {
             engine,
             router,
             tag,
@@ -379,7 +379,7 @@ where
         let tasks = self.tasks.lock().unwrap();
         let new_tasks= tasks.clone_new();
         let data_arrive_event = new_tasks.data_arrive_event.clone();
-        let mut async_writer = AsyncWriter {
+        let mut async_writer = Self {
             engine: self.engine.clone(),
             router: self.router.clone(),
             tag: self.tag.clone(),
@@ -406,12 +406,14 @@ where
                             let mut tasks = x.tasks.lock().unwrap();
                             while tasks.no_task() ||
                                 (!tasks.have_big_enough_task() && now_ts.elapsed() < x.io_max_wait) {
-                                tasks = x.data_arrive_event.wait(tasks).unwrap();
+                                tasks = x.data_arrive_event.wait_timeout(tasks, x.io_max_wait).unwrap().0;
                             }
                             tasks.detach_task()
                         };
 
-                        assert!(!task.is_empty());
+                        if task.is_empty() {
+                            continue;
+                        }
                         x.sync_write(&mut task.wb, &task.unsynced_readies);
 
                         // TODO: block if too many tasks

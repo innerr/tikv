@@ -47,7 +47,7 @@ pub const INIT_EPOCH_VER: u64 = 1;
 pub const INIT_EPOCH_CONF_VER: u64 = 1;
 
 // One extra slot for VecDeque internal usage.
-const MAX_CACHE_CAPACITY: usize = 1024 - 1;
+//const MAX_CACHE_CAPACITY: usize = 1024 - 1;
 const SHRINK_CACHE_CAPACITY: usize = 64;
 
 pub const JOB_STATUS_PENDING: usize = 0;
@@ -195,8 +195,9 @@ impl EntryCache {
                 );
             }
         }
-        let mut start_idx = 0;
+        let start_idx = 0;
         /*
+        let mut start_idx = 0;
         if let Some(len) = (self.cache.len() + entries.len()).checked_sub(MAX_CACHE_CAPACITY) {
             if len < self.cache.len() {
                 let mut drained_cache_entries_size = 0;
