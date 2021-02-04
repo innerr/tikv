@@ -458,6 +458,7 @@ where
         if !self.kv_wb_mut().is_empty() {
             let mut write_opts = engine_traits::WriteOptions::new();
             write_opts.set_sync(need_sync);
+            write_opts.set_wal_enabled(false);
             self.kv_wb()
                 .write_to_engine(&self.engine, &write_opts)
                 .unwrap_or_else(|e| {
@@ -922,7 +923,7 @@ where
         if !data.is_empty() {
             let cmd = util::parse_data_at(data, index, &self.tag);
 
-            if should_write_to_engine(&cmd) || apply_ctx.kv_wb().should_write_to_engine() {
+            if should_write_to_engine(&cmd)/* || apply_ctx.kv_wb().should_write_to_engine() */{
                 apply_ctx.commit(self);
                 if let Some(start) = self.handle_start.as_ref() {
                     if start.elapsed() >= apply_ctx.yield_duration {
