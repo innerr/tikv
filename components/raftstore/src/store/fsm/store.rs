@@ -684,6 +684,10 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
             STORE_PERF_CONTEXT_TIME_HISTOGRAM_STATIC
         );
         fail_point!("raft_after_save");
+        for ts in &self.poll_ctx.proposal_times {
+            STORE_KNOW_PERSIST_DURATION_HISTOGRAM
+                .observe(duration_to_sec(ts.elapsed()));
+        }
         if ready_cnt != 0 {
             let mut batch_pos = 0;
             let mut ready_res = mem::take(&mut self.poll_ctx.ready_res);
@@ -781,6 +785,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
             self.poll_ctx.cfg = incoming.clone();
             self.poll_ctx.update_ticks_timeout();
         }
+        self.poll_ctx.proposal_times.clear();
     }
 
     fn handle_control(&mut self, store: &mut StoreFsm<EK>) -> Option<usize> {

@@ -1086,13 +1086,6 @@ where
         Ok(())
     }
 
-    fn report_know_persist_duration<T>(&self, ctx: &PollContext<EK, ER, T>) {
-        for ts in &ctx.proposal_times {
-            STORE_KNOW_PERSIST_DURATION_HISTOGRAM
-                .observe(duration_to_sec(ts.elapsed()));
-        }
-    }
-
     fn report_know_commit_duration(&self, pre_commit_index: u64) {
         for index in pre_commit_index + 1..=self.raft_group.raft.raft_log.committed {
             if let Some((term, scheduled_ts)) = self.proposals.find_scheduled_ts(index) {
@@ -1576,7 +1569,6 @@ where
 
         let mut ready = self.raft_group.ready_since(self.last_applying_idx);
 
-        ctx.proposal_times.clear();
         for entry in ready.entries() {
             if let Some((term, scheduled_ts)) = self.proposals.find_scheduled_ts(entry.get_index())
             {
@@ -1837,7 +1829,7 @@ where
         self.apply_reads(ctx, ready);
     }
 
-    pub fn handle_raft_ready_advance<T>(&mut self, ready: Ready, ctx: &PollContext<EK, ER, T>) {
+    pub fn handle_raft_ready_advance(&mut self, ready: Ready) {
         if !ready.snapshot().is_empty() {
             // Snapshot's metadata has been applied.
             self.last_applying_idx = self.get_store().truncated_index();
@@ -1852,7 +1844,6 @@ where
             );
         } else {
             self.raft_group.advance_append(ready);
-            self.report_know_persist_duration(ctx);
         }
         self.proposals.gc();
     }
