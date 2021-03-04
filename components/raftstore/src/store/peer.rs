@@ -90,6 +90,19 @@ impl<S: Snapshot> ProposalQueue<S> {
         }
     }
 
+    fn find_scheduled_ts(&self, index: u64) -> Option<(u64, Instant)> {
+        let map = |p: &Proposal<_>| (p.index);
+        let idx = self.queue.binary_search_by_key(&index, map);
+        if let Ok(i) = idx {
+            self.queue[i]
+                .cb
+                .get_scheduled_ts()
+                .map(|ts| (self.queue[i].term, ts))
+        } else {
+            None
+        }
+    }
+
     fn find_propose_time(&self, key: (u64, u64)) -> Option<Timespec> {
         let (front, back) = self.queue.as_slices();
         let map = |p: &Proposal<_>| (p.term, p.index);
@@ -119,7 +132,7 @@ impl<S: Snapshot> ProposalQueue<S> {
     }
 
     fn push(&mut self, p: Proposal<S>) {
-        if let Some(f) = self.queue.front() {
+        if let Some(f) = self.queue.back() {
             // The term must be increasing among all log entries and the index
             // must be increasing inside a given term
             assert!((p.term, p.index) > (f.term, f.index));
@@ -1067,8 +1080,34 @@ where
             return Ok(());
         }
 
+        let pre_commit_index = self.raft_group.raft.raft_log.committed;
         self.raft_group.step(m)?;
+        self.report_know_commit_duration(pre_commit_index);
         Ok(())
+    }
+
+    fn report_know_persist_duration<T>(&self, ctx: &PollContext<EK, ER, T>) {
+        for ts in &ctx.proposal_times {
+            STORE_KNOW_PERSIST_DURATION_HISTOGRAM
+                        .observe(duration_to_sec(ts.elapsed()));
+        }
+                    
+    }
+
+    fn report_know_commit_duration(&self, pre_commit_index: u64) {
+        for index in pre_commit_index + 1..=self.raft_group.raft.raft_log.committed {
+            if let Some((term, scheduled_ts)) = self.proposals.find_scheduled_ts(index) {
+                if self
+                    .get_store()
+                    .term(index)
+                    .map(|t| t == term)
+                    .unwrap_or(false)
+                {
+                    STORE_KNOW_COMMIT_DURATION_HISTOGRAM
+                        .observe(duration_to_sec(scheduled_ts.elapsed()));
+                }
+            }
+        }
     }
 
     /// Checks and updates `peer_heartbeats` for the peer.
@@ -1538,6 +1577,16 @@ where
 
         let mut ready = self.raft_group.ready_since(self.last_applying_idx);
 
+        ctx.proposal_times.clear();
+        for entry in ready.entries() {
+            if let Some((term, scheduled_ts)) = self.proposals.find_scheduled_ts(entry.get_index())
+            {
+                if entry.term == term {
+                    ctx.proposal_times.push(scheduled_ts);
+                }
+            }
+        }
+
         self.on_role_changed(ctx, &ready);
 
         self.add_ready_metric(&ready, &mut ctx.raft_metrics.ready);
@@ -1611,6 +1660,10 @@ where
                 panic!("{} failed to handle raft ready: {:?}", self.tag, e)
             }
         };
+
+        for ts in &ctx.proposal_times {
+            STORE_TO_WRITE_QUEUE_DURATION_HISTOGRAM.observe(duration_to_sec(ts.elapsed()));
+        }
 
         Some((ready, invoke_ctx))
     }
@@ -1783,11 +1836,12 @@ where
         self.apply_reads(ctx, ready);
     }
 
-    pub fn handle_raft_ready_advance(&mut self, ready: Ready) {
+    pub fn handle_raft_ready_advance<T>(&mut self, ready: Ready, ctx: &PollContext<EK, ER, T>) {
         if !ready.snapshot().is_empty() {
             // Snapshot's metadata has been applied.
             self.last_applying_idx = self.get_store().truncated_index();
             self.raft_group.advance_append(ready);
+            self.report_know_persist_duration(ctx);
             // Because we only handle raft ready when not applying snapshot, so following
             // line won't be called twice for the same snapshot.
             self.raft_group.advance_apply(self.last_applying_idx);
@@ -1798,6 +1852,7 @@ where
             );
         } else {
             self.raft_group.advance_append(ready);
+            self.report_know_persist_duration(ctx);
         }
         self.proposals.gc();
     }
