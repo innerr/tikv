@@ -1089,9 +1089,8 @@ where
     fn report_know_persist_duration<T>(&self, ctx: &PollContext<EK, ER, T>) {
         for ts in &ctx.proposal_times {
             STORE_KNOW_PERSIST_DURATION_HISTOGRAM
-                        .observe(duration_to_sec(ts.elapsed()));
+                .observe(duration_to_sec(ts.elapsed()));
         }
-                    
     }
 
     fn report_know_commit_duration(&self, pre_commit_index: u64) {
@@ -1647,6 +1646,7 @@ where
             let msgs = ready.messages.drain(..);
             ctx.need_flush_trans = true;
             self.send(&mut ctx.trans, msgs, &mut ctx.raft_metrics.message);
+            ctx.trans.flush();
         }
 
         let invoke_ctx = match self
@@ -1712,6 +1712,7 @@ where
                     &mut ctx.raft_metrics.message,
                 );
                 ctx.need_flush_trans = true;
+                ctx.trans.flush();
             }
         }
 
@@ -1841,7 +1842,6 @@ where
             // Snapshot's metadata has been applied.
             self.last_applying_idx = self.get_store().truncated_index();
             self.raft_group.advance_append(ready);
-            self.report_know_persist_duration(ctx);
             // Because we only handle raft ready when not applying snapshot, so following
             // line won't be called twice for the same snapshot.
             self.raft_group.advance_apply(self.last_applying_idx);
