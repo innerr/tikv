@@ -192,6 +192,30 @@ lazy_static! {
             "TODO",
             exponential_buckets(0.0005, 2.0, 20).unwrap()
         ).unwrap();
+    pub static ref STORE_BATCH_WAIT_DURATION_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_raftstore_store_batch_wait_duration_seconds",
+            "TODO",
+            exponential_buckets(0.00001, 2.0, 26).unwrap()
+        ).unwrap();
+    pub static ref STORE_TO_WRITE_QUEUE_DURATION_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_raftstore_store_to_write_queue_duration_seconds",
+            "TODO",
+            exponential_buckets(0.00001, 2.0, 26).unwrap()
+        ).unwrap();
+    pub static ref STORE_KNOW_PERSIST_DURATION_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_raftstore_store_know_persist_duration_seconds",
+            "TODO",
+            exponential_buckets(0.00001, 2.0, 26).unwrap()
+        ).unwrap();
+    pub static ref STORE_KNOW_COMMIT_DURATION_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_raftstore_store_know_commit_duration_seconds",
+            "TODO",
+            exponential_buckets(0.00001, 2.0, 26).unwrap()
+        ).unwrap();
 
     pub static ref PEER_PROPOSAL_COUNTER_VEC: IntCounterVec =
         register_int_counter_vec!(

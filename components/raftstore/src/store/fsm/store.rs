@@ -338,6 +338,7 @@ where
     pub perf_context_statistics: PerfContextStatistics,
     pub tick_batch: Vec<PeerTickBatch>,
     pub node_start_time: Option<TiInstant>,
+    pub proposal_times: Vec<Instant>,
 }
 
 impl<EK, ER, T> HandleRaftReadyContext<EK::WriteBatch, ER::LogBatch> for PollContext<EK, ER, T>
@@ -683,6 +684,10 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
             STORE_PERF_CONTEXT_TIME_HISTOGRAM_STATIC
         );
         fail_point!("raft_after_save");
+        for ts in &self.poll_ctx.proposal_times {
+            STORE_KNOW_PERSIST_DURATION_HISTOGRAM
+                .observe(duration_to_sec(ts.elapsed()));
+        }
         if ready_cnt != 0 {
             let mut batch_pos = 0;
             let mut ready_res = mem::take(&mut self.poll_ctx.ready_res);
@@ -780,6 +785,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
             self.poll_ctx.cfg = incoming.clone();
             self.poll_ctx.update_ticks_timeout();
         }
+        self.poll_ctx.proposal_times.clear();
     }
 
     fn handle_control(&mut self, store: &mut StoreFsm<EK>) -> Option<usize> {
@@ -1099,6 +1105,7 @@ where
             perf_context_statistics: PerfContextStatistics::new(self.cfg.value().perf_level),
             tick_batch: vec![PeerTickBatch::default(); 256],
             node_start_time: Some(TiInstant::now_coarse()),
+            proposal_times: vec![],
         };
         ctx.update_ticks_timeout();
         let tag = format!("[store {}]", ctx.store.get_id());
