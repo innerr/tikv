@@ -99,16 +99,6 @@ where
         }
     }
 
-    pub fn get_scheduled_ts(&self) -> Option<Instant> {
-        match self {
-            Callback::Write {
-                cb: (_cb, scheduled_ts),
-                ..
-            } => Some(scheduled_ts.clone()),
-            _ => None,
-        }
-    }
-
     pub fn invoke_with_response(self, resp: RaftCmdResponse) -> Option<Instant> {
         match self {
             Callback::None => None,
@@ -126,6 +116,16 @@ where
                 cb(resp);
                 Some(scheduled_ts)
             }
+        }
+    }
+
+    pub fn get_scheduled_ts(&self) -> Option<Instant> {
+        match self {
+            Callback::Write {
+                cb: (_cb, scheduled_ts),
+                ..
+            } => Some(scheduled_ts.clone()),
+            _ => None,
         }
     }
 

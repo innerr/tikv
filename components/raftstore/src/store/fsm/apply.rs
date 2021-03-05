@@ -316,6 +316,39 @@ where
     fn push(&mut self, cb: Option<Callback<EK::Snapshot>>, cmd: Cmd) {
         self.cbs.push((cb, cmd));
     }
+
+    pub fn on_write(&self) {
+        for (cb, _cmd) in &self.cbs {
+            if let Some(cb) = cb {
+                if let Some(scheduled_ts) = cb.get_scheduled_ts() {
+                    APPLY_TO_WRITE_DURATION_HISTOGRAM
+                        .observe(duration_to_sec(scheduled_ts.elapsed()));
+                }
+            };
+        }
+    }
+
+    pub fn on_write_end(&self) {
+        for (cb, _cmd) in &self.cbs {
+            if let Some(cb) = cb {
+                if let Some(scheduled_ts) = cb.get_scheduled_ts() {
+                    APPLY_WRITE_END_DURATION_HISTOGRAM
+                        .observe(duration_to_sec(scheduled_ts.elapsed()));
+                }
+            };
+        }
+    }
+
+    pub fn on_before_callback(&self) {
+        for (cb, _cmd) in &self.cbs {
+            if let Some(cb) = cb {
+                if let Some(scheduled_ts) = cb.get_scheduled_ts() {
+                    APPLY_BEFORE_CALLBACK_DURATION_HISTOGRAM
+                        .observe(duration_to_sec(scheduled_ts.elapsed()));
+                }
+            };
+        }
+    }
 }
 
 pub trait Notifier<EK: KvEngine>: Send {
@@ -460,6 +493,9 @@ where
     pub fn write_to_db(&mut self) -> bool {
         let need_sync = self.sync_log_hint;
         if !self.kv_wb_mut().is_empty() {
+            for cbs in &*self.cbs {
+                cbs.on_write();
+            }
             let mut write_opts = engine_traits::WriteOptions::new();
             write_opts.set_sync(need_sync);
             self.kv_wb()
@@ -483,10 +519,16 @@ where
             }
             self.kv_wb_last_bytes = 0;
             self.kv_wb_last_keys = 0;
+            for cbs in &*self.cbs {
+                cbs.on_write_end();
+            }
         }
         // Call it before invoking callback for preventing Commit is executed before Prewrite is observed.
         self.host.on_flush_apply(self.engine.clone());
 
+        for cbs in &*self.cbs {
+            cbs.on_before_callback();
+        }
         for cbs in self.cbs.drain(..) {
             cbs.invoke_all(&self.host);
         }
