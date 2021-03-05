@@ -265,6 +265,6 @@ impl<EK: KvEngine, ER: RaftEngine> RaftStoreRouter<EK> for RaftRouter<EK, ER> {
     }
 
     fn broadcast_normal(&self, msg_gen: impl FnMut() -> PeerMsg<EK>) {
-        batch_system::Router::broadcast_normal(self, msg_gen)
+        hash_system::Router::broadcast_normal(self, msg_gen)
     }
 }

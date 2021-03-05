@@ -43,13 +43,14 @@ pub enum IOType {
     LoadBalance,
     Import,
     Export,
+    ForegroundWrite,
 }
 
 thread_local! {
     static IO_TYPE: Cell<IOType> = Cell::new(IOType::Other)
 }
 
-fn set_io_type(new_io_type: IOType) {
+pub fn set_io_type(new_io_type: IOType) {
     IO_TYPE.with(|io_type| {
         io_type.set(new_io_type);
     });

@@ -1005,25 +1005,27 @@ where
         self.fsm.tick_registry.insert(tick);
 
         let region_id = self.region_id();
-        let mb = match self.ctx.router.mailbox(region_id) {
-            Some(mb) => mb,
-            None => {
-                self.fsm.tick_registry.remove(tick);
-                error!(
-                    "failed to get mailbox";
-                    "region_id" => self.fsm.region_id(),
-                    "peer_id" => self.fsm.peer_id(),
-                    "tick" => ?tick,
-                );
-                return;
-            }
-        };
+        //let mb = match self.ctx.router.mailbox(region_id) {
+        //    Some(mb) => mb,
+        //    None => {
+        //        self.fsm.tick_registry.remove(tick);
+        //        error!(
+        //            "failed to get mailbox";
+        //            "region_id" => self.fsm.region_id(),
+        //            "peer_id" => self.fsm.peer_id(),
+        //            "tick" => ?tick,
+        //        );
+        //        return;
+        //    }
+        //};
+
+        let router = self.ctx.router.clone();
         let peer_id = self.fsm.peer.peer_id();
         let cb = Box::new(move || {
             // This can happen only when the peer is about to be destroyed
             // or the node is shutting down. So it's OK to not to clean up
             // registry.
-            if let Err(e) = mb.force_send(PeerMsg::Tick(tick)) {
+            if let Err(e) = router.force_send(region_id, PeerMsg::Tick(tick)) {
                 debug!(
                     "failed to schedule peer tick";
                     "region_id" => region_id,
@@ -2290,8 +2292,8 @@ where
                 // check again after split.
                 new_peer.peer.size_diff_hint = self.ctx.cfg.region_split_check_diff.0;
             }
-            let mailbox = BasicMailbox::new(sender, new_peer);
-            self.ctx.router.register(new_region_id, mailbox);
+            // let mailbox = BasicMailbox::new(sender, new_peer);
+            self.ctx.router.register(new_region_id, new_peer);
             self.ctx
                 .router
                 .force_send(new_region_id, PeerMsg::Start)

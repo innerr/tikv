@@ -76,6 +76,7 @@ async-stream = "0.2"
 async-trait = "0.1"
 backtrace = "0.3"
 batch-system = { path = "components/batch-system", default-features = false }
+hash-system = { path = "components/hash-system", default-features = false }
 bitflags = "1.0.1"
 byteorder = "1.2"
 cache-size = "0.5"
@@ -224,6 +225,7 @@ members = [
   "components/txn_types",
   "components/resolved_ts",
   "components/batch-system",
+  "components/hash-system",
   "components/cdc",
   "components/raftstore",
   "components/into_other",

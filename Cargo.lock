@@ -639,6 +639,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "collections"
+version = "0.1.0"
+dependencies = [
+ "fxhash",
+ "tikv_alloc",
+]
+
+[[package]]
 name = "concurrency_manager"
 version = "0.0.1"
 dependencies = [
@@ -1636,6 +1644,24 @@ dependencies = [
  "slab",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "hash-system"
+version = "0.1.0"
+dependencies = [
+ "batch-system",
+ "collections",
+ "criterion",
+ "crossbeam",
+ "derive_more",
+ "file_system",
+ "seahash",
+ "serde",
+ "serde_derive",
+ "slog",
+ "slog-global",
+ "tikv_util",
 ]
 
 [[package]]
@@ -3167,6 +3193,7 @@ dependencies = [
  "fs2",
  "futures 0.3.7",
  "futures-util",
+ "hash-system",
  "hex 0.4.2",
  "into_other",
  "keys",
@@ -3704,6 +3731,12 @@ name = "scopeguard"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d29ab0c6d3fc0ee92fe66e2d99f700eab17a8d57d1c1d3b748380fb20baa78cd"
+
+[[package]]
+name = "seahash"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
 name = "security"
@@ -4661,6 +4694,7 @@ dependencies = [
  "futures-executor",
  "futures-util",
  "grpcio",
+ "hash-system",
  "hex 0.4.2",
  "http",
  "hyper",
