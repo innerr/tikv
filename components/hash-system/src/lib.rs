@@ -4,6 +4,7 @@ extern crate tikv_util;
 #[macro_use]
 extern crate derive_more;
 
+mod flip;
 mod poll;
 mod router;
 

@@ -1,10 +1,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use std::thread::{self, JoinHandle};
-
+use crate::flip::{self, Receiver, Sender};
 use batch_system::{Config, Fsm};
 use collections::{HashMap, HashSet};
-use crossbeam::channel::{self, Receiver, Sender};
 use file_system::{set_io_type, IOType};
 
 use crate::router::Router;
@@ -38,21 +38,12 @@ pub struct Poller<N: Fsm, C: Fsm, Handler> {
 impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
     fn recv_batch(&mut self, batch: &mut Vec<Message<N, C>>) {
         loop {
-            if let Ok(msg) = self.msg_receiver.try_recv() {
-                batch.push(msg);
-                if batch.len() >= self.max_batch_size {
-                    return;
-                }
-                continue;
+            self.msg_receiver.swap(batch);
+            if !batch.is_empty() {
+                return;
+            } else {
+                thread::sleep(Duration::from_micros(10));
             }
-            if batch.is_empty() {
-                self.handler.pause();
-                if let Ok(msg) = self.msg_receiver.recv() {
-                    batch.push(msg);
-                    continue;
-                }
-            }
-            break;
         }
     }
 
@@ -163,8 +154,7 @@ where
         self.name_prefix = Some(name_prefix);
         let control = self.control.take().unwrap();
         self.senders[0]
-            .send(Message::RegisterControl(control))
-            .unwrap();
+            .send(Message::RegisterControl(control));
     }
 
     /// Shutdown the batch system and wait till all background threads exit.
@@ -200,7 +190,7 @@ pub fn create_system<N: Fsm, C: Fsm>(
     control: Box<C>,
 ) -> (Router<N, C>, System<N, C>) {
     let (senders, receivers): (Vec<_>, Vec<_>) =
-        (0..cfg.pool_size).map(|_| channel::unbounded()).unzip();
+        (0..cfg.pool_size).map(|_| flip::bounded(1000000)).unzip();
     let router = Router::new(senders.clone());
     let system = System {
         name_prefix: None,

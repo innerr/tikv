@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use batch_system::Fsm;
 use collections::HashMap;
-use crossbeam::{SendError, Sender, TrySendError};
+use crate::flip::{SendError, Sender, TrySendError};
 use tikv_util::lru::LruCache;
 use tikv_util::Either;
 

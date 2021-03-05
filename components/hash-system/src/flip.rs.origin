@@ -1,0 +1,45 @@
+use crossbeam::channel::{self, Receiver as R, Sender as S};
+pub use crossbeam::channel::{TryRecvError, RecvError, TrySendError, SendError};
+
+pub struct Receiver<T> {
+    r: R<T>
+}
+
+impl<T> Receiver<T> {
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        self.r.try_recv()
+    }
+    pub fn recv(&self) -> Result<T, RecvError> {
+        self.r.recv()
+    }
+}
+
+impl<T> Clone for Receiver<T> {
+    fn clone(&self) -> Self {
+        Receiver { r: self.r.clone() }
+    }
+}
+
+pub struct Sender<T> {
+    s: S<T>
+}
+
+impl<T> Sender<T> {
+    pub fn try_send(&self, msg: T) -> Result<(), TrySendError<T>> {
+        self.s.try_send(msg)
+    }
+    pub fn send(&self, msg: T) -> Result<(), SendError<T>> {
+        self.s.send(msg)
+    }
+}
+
+impl<T> Clone for Sender<T> {
+    fn clone(&self) -> Self {
+        Sender { s: self.s.clone() }
+    }
+}
+
+pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
+    let (s, r) = channel::unbounded::<T>();
+    (Sender { s }, Receiver { r })
+}
