@@ -9,9 +9,13 @@ use std::sync::mpsc;
 
 /// Transports messages between different Raft peers.
 pub trait Transport: Send + Clone {
-    fn send(&mut self, msg: RaftMessage) -> Result<()>;
+    fn send(&mut self, seq_id: Option<usize>, msg: RaftMessage) -> Result<()>;
 
     fn need_flush(&self) -> bool;
+
+    fn try_flush(&mut self) {
+        self.flush();
+    }
 
     fn flush(&mut self);
 }

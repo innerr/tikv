@@ -1,10 +1,11 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::cell::RefCell;
+use rand::Rng;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use std::{cell::RefCell, ops::Sub};
 use std::{cmp, mem, u64, usize};
 
 use crossbeam::atomic::AtomicCell;
@@ -30,7 +31,6 @@ use raft::{
     StateRole, INVALID_INDEX, NO_LIMIT,
 };
 use raft_proto::ConfChangeI;
-use rand::Rng;
 use smallvec::SmallVec;
 use time::Timespec;
 use uuid::Uuid;
@@ -77,6 +77,7 @@ pub enum StaleState {
     LeaderMissing,
 }
 
+#[derive(Debug)]
 struct ProposalQueue<S>
 where
     S: Snapshot,
@@ -496,8 +497,12 @@ where
     /// (The number of ready which has a snapshot, Whether this snapshot is scheduled)
     snapshot_ready_status: (u64, bool),
     persisted_number: u64,
-    /// Async writer id
-    async_writer_id: Option<usize>,
+    /// Used for async writer id, raft client
+    /// io thread must consume the io request before this peer has been destroyed.
+    /// But grpc thread doesn't has this feature so the msg may be reorder if a new peer
+    /// with the same region id is created after this peer is destroyed.
+    /// TODO: should think it twice(peer id is different so it should be no problem)
+    random_id: usize,
 }
 
 impl<EK, ER> Peer<EK, ER>
@@ -593,7 +598,7 @@ where
             unpersisted_numbers: VecDeque::default(),
             snapshot_ready_status: (0, false),
             persisted_number: 0,
-            async_writer_id: None,
+            random_id: rand::thread_rng().gen(),
         };
 
         // If this region has only one peer and I am the one, campaign directly.
@@ -998,11 +1003,15 @@ where
     }
 
     #[inline]
-    fn send<T, I>(&mut self, trans: &mut T, msgs: I, metrics: &mut RaftMessageMetrics)
+    fn switch_to_raft_msg<I>(
+        &mut self,
+        msgs: I,
+        metrics: &mut RaftMessageMetrics,
+    ) -> Vec<RaftMessage>
     where
-        T: Transport,
         I: IntoIterator<Item = eraftpb::Message>,
     {
+        let mut raft_msgs = vec![];
         for msg in msgs {
             let msg_type = msg.get_msg_type();
             match msg_type {
@@ -1044,8 +1053,11 @@ where
                 | MessageType::MsgSnapStatus
                 | MessageType::MsgCheckQuorum => {}
             }
-            self.send_raft_message(msg, trans);
+            if let Some(m) = self.fill_raft_message(msg) {
+                raft_msgs.push(m);
+            }
         }
+        raft_msgs
     }
 
     /// Steps the raft message.
@@ -1129,8 +1141,13 @@ where
                     .map(|t| t == term)
                     .unwrap_or(false)
                 {
-                    STORE_KNOW_COMMIT_DURATION_HISTOGRAM
-                        .observe(duration_to_sec(scheduled_ts.elapsed()));
+                    if index <= self.raft_group.raft.raft_log.persisted {
+                        STORE_KNOW_COMMIT_DURATION_HISTOGRAM
+                            .observe(duration_to_sec(scheduled_ts.elapsed()));
+                    } else {
+                        STORE_KNOW_COMMIT_NOT_PERSIST_DURATION_HISTOGRAM
+                            .observe(duration_to_sec(scheduled_ts.elapsed()));
+                    }
                 }
             }
         }
@@ -1608,6 +1625,7 @@ where
         &mut self,
         ctx: &mut PollContext<EK, ER, T>,
     ) -> Option<(Ready, InvokeContext)> {
+        let now = Instant::now();
         if self.pending_remove {
             return None;
         }
@@ -1715,7 +1733,17 @@ where
             "peer_id" => self.peer.get_id(),
         );
 
+        let mut proposal_times = vec![];
+
         let mut ready = self.raft_group.ready();
+        for entry in ready.entries() {
+            if let Some((term, scheduled_ts)) = self.proposals.find_scheduled_ts(entry.get_index())
+            {
+                if entry.term == term {
+                    proposal_times.push(scheduled_ts);
+                }
+            }
+        }
 
         if !ready.must_sync() {
             // If this ready need not to sync, the term, vote must not be changed,
@@ -1740,44 +1768,36 @@ where
             }
         }
 
-        if !ready.messages().is_empty() {
-            if !self.is_leader() {
-                fail_point!("raft_before_follower_send");
-            }
-            for vec_msg in ready.take_messages() {
-                self.send(&mut ctx.trans, vec_msg, &mut ctx.raft_metrics.message);
-            }
-            ctx.trans.flush();
-        }
-
-        self.apply_reads(ctx, &ready);
-
         if !ready.committed_entries().is_empty() {
             self.handle_raft_committed_entries(ctx, ready.take_committed_entries());
         }
 
-        let async_writer_id = if let Some(id) = self.async_writer_id {
-            id
-        } else {
-            assert!(ctx.async_writers.len() > 0);
-            let id = rand::thread_rng().gen_range(0, ctx.async_writers.len());
-            self.async_writer_id = Some(id);
-            id
-        };
-        let mut proposal_times = vec![];
-        for entry in ready.entries() {
-            if let Some((term, scheduled_ts)) = self.proposals.find_scheduled_ts(entry.get_index())
-            {
-                if entry.term == term {
-                    proposal_times.push(scheduled_ts);
-                }
+        let msgs = if !ready.messages().is_empty() {
+            let msgs =
+                self.switch_to_raft_msg(ready.take_messages(), &mut ctx.raft_metrics.message);
+            if self.is_leader() {
+                self.send_raft_messages(&mut ctx.trans, msgs);
+                Vec::new()
+            } else {
+                fail_point!("raft_before_follower_send");
+                msgs
             }
-        }
+        } else {
+            Vec::new()
+        };
+
+        self.apply_reads(ctx, &ready);
+
+        let async_writer_id = self.random_id % ctx.async_write_senders.len();
+        let msg_seq_id = self.random_id;
+
         let invoke_ctx = match self.mut_store().handle_raft_ready(
             ctx,
             &mut ready,
             destroy_regions,
             async_writer_id,
+            msgs,
+            msg_seq_id,
             proposal_times,
         ) {
             Ok(r) => r,
@@ -1874,6 +1894,7 @@ where
                         .observe(duration_to_sec(scheduled_ts.elapsed()));
                 }
             }
+
             fail_point!(
                 "leader_commit_prepare_merge",
                 {
@@ -1975,12 +1996,15 @@ where
             }
 
             if !light_rd.messages().is_empty() {
-                if !self.is_leader() {
+                assert!(self.is_leader());
+                /*if !self.is_leader() {
                     fail_point!("raft_before_follower_send");
-                }
-                for vec_msg in light_rd.take_messages() {
-                    self.send(&mut ctx.trans, vec_msg, &mut ctx.raft_metrics.message);
-                }
+                }*/
+
+                let msgs = self
+                    .switch_to_raft_msg(light_rd.take_messages(), &mut ctx.raft_metrics.message);
+
+                self.send_raft_messages(&mut ctx.trans, msgs);
             }
 
             if !light_rd.committed_entries().is_empty() {
@@ -3439,7 +3463,7 @@ where
         }
     }
 
-    fn send_raft_message<T: Transport>(&mut self, msg: eraftpb::Message, trans: &mut T) {
+    fn fill_raft_message(&mut self, msg: eraftpb::Message) -> Option<RaftMessage> {
         let mut send_msg = RaftMessage::default();
         send_msg.set_region_id(self.region_id);
         // set current epoch
@@ -3455,7 +3479,7 @@ where
                     "peer_id" => self.peer.get_id(),
                     "to_peer" => msg.get_to(),
                 );
-                return;
+                return None;
             }
         };
 
@@ -3490,24 +3514,33 @@ where
         }
         send_msg.set_message(msg);
 
-        if let Err(e) = trans.send(send_msg) {
-            warn!(
-                "failed to send msg to other peer";
-                "region_id" => self.region_id,
-                "peer_id" => self.peer.get_id(),
-                "target_peer_id" => to_peer_id,
-                "target_store_id" => to_store_id,
-                "err" => ?e,
-                "error_code" => %e.error_code(),
-            );
-            if to_peer_id == self.leader_id() {
-                self.leader_unreachable = true;
-            }
-            // unreachable store
-            self.raft_group.report_unreachable(to_peer_id);
-            if msg_type == eraftpb::MessageType::MsgSnapshot {
-                self.raft_group
-                    .report_snapshot(to_peer_id, SnapshotStatus::Failure);
+        Some(send_msg)
+    }
+
+    pub fn send_raft_messages<T: Transport>(&mut self, trans: &mut T, send_msgs: Vec<RaftMessage>) {
+        for msg in send_msgs {
+            let to_peer_id = msg.get_to_peer().get_id();
+            let to_store_id = msg.get_to_peer().get_store_id();
+            let msg_type = msg.get_message().get_msg_type();
+            if let Err(e) = trans.send(Some(self.random_id), msg) {
+                warn!(
+                    "failed to send msg to other peer";
+                    "region_id" => self.region_id,
+                    "peer_id" => self.peer.get_id(),
+                    "target_peer_id" => to_peer_id,
+                    "target_store_id" => to_store_id,
+                    "err" => ?e,
+                    "error_code" => %e.error_code(),
+                );
+                if to_peer_id == self.leader_id() {
+                    self.leader_unreachable = true;
+                }
+                // unreachable store
+                self.raft_group.report_unreachable(to_peer_id);
+                if msg_type == eraftpb::MessageType::MsgSnapshot {
+                    self.raft_group
+                        .report_snapshot(to_peer_id, SnapshotStatus::Failure);
+                }
             }
         }
     }
@@ -3533,7 +3566,7 @@ where
         send_msg.set_to_peer(peer.clone());
         let extra_msg = send_msg.mut_extra_msg();
         extra_msg.set_type(ExtraMessageType::MsgRegionWakeUp);
-        if let Err(e) = ctx.trans.send(send_msg) {
+        if let Err(e) = ctx.trans.send(Some(self.random_id), send_msg) {
             error!(?e;
                 "failed to send wake up message";
                 "region_id" => self.region_id,
@@ -3563,7 +3596,7 @@ where
             send_msg.set_to_peer(peer.clone());
             let extra_msg = send_msg.mut_extra_msg();
             extra_msg.set_type(ExtraMessageType::MsgCheckStalePeer);
-            if let Err(e) = ctx.trans.send(send_msg) {
+            if let Err(e) = ctx.trans.send(Some(self.random_id), send_msg) {
                 error!(?e;
                     "failed to send check stale peer message";
                     "region_id" => self.region_id,
@@ -3611,7 +3644,7 @@ where
         let extra_msg = send_msg.mut_extra_msg();
         extra_msg.set_type(ExtraMessageType::MsgWantRollbackMerge);
         extra_msg.set_premerge_commit(premerge_commit);
-        if let Err(e) = ctx.trans.send(send_msg) {
+        if let Err(e) = ctx.trans.send(Some(self.random_id), send_msg) {
             error!(?e;
                 "failed to send want rollback merge message";
                 "region_id" => self.region_id,
