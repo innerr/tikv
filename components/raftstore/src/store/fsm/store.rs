@@ -789,7 +789,6 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport>
         delegate.collect_ready();
         self.poll_ctx.trans.try_flush();
         self.maybe_flush_async_write(false);
-        expected_msg_count
     }
 
     fn end(&mut self, peers: &mut HashMap<u64, Box<PeerFsm<EK, ER>>>) {
@@ -809,13 +808,9 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport>
         self.poll_ctx.io_lock_metrics.flush();
     }
 
-    fn pause(&mut self) -> bool {
+    fn pause(&mut self) {
         self.poll_ctx.trans.flush();
         self.maybe_flush_async_write(true);
-        // If there are cached data and go into pause status, that will cause high latency or hunger
-        // so it should return false(means pause failed) when there are still jobs to do
-        //all_synced_and_flushed
-        true
     }
 }
 
