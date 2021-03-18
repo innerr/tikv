@@ -42,8 +42,8 @@ where
     T: RaftStoreRouter<RocksEngine> + Unpin + 'static,
     S: StoreAddrResolver + Unpin + 'static,
 {
-    fn send(&mut self, msg: RaftMessage) -> RaftStoreResult<()> {
-        match self.raft_client.send(msg) {
+    fn send(&mut self, seq_id: Option<usize>, msg: RaftMessage) -> RaftStoreResult<()> {
+        match self.raft_client.send(seq_id, msg) {
             Ok(()) => Ok(()),
             Err(reason) => Err(raftstore::Error::Transport(reason)),
         }
@@ -53,7 +53,11 @@ where
         self.raft_client.need_flush()
     }
 
+    fn try_flush(&mut self) {
+        self.raft_client.try_flush();
+    }
+
     fn flush(&mut self) {
-        self.raft_client.flush();
+        self.raft_client.force_flush();
     }
 }

@@ -8,17 +8,21 @@ use std::sync::Arc;
 use std::time::Instant;
 use std::{cmp, error, u64};
 
+use crossbeam::channel::{SendError, Sender};
+
 use engine_traits::CF_RAFT;
 use engine_traits::{Engines, KvEngine, Mutable, Peekable};
 use keys::{self, enc_end_key, enc_start_key};
 use kvproto::metapb::{self, Region};
 use kvproto::raft_serverpb::{
-    MergeState, PeerState, RaftApplyState, RaftLocalState, RaftSnapshotData, RegionLocalState,
+    MergeState, PeerState, RaftApplyState, RaftLocalState, RaftMessage, RaftSnapshotData,
+    RegionLocalState,
 };
 use protobuf::Message;
 use raft::eraftpb::{ConfState, Entry, HardState, Snapshot};
 use raft::{self, Error as RaftError, RaftState, Ready, Storage, StorageError};
 
+use crate::store::fsm::store::AsyncWriteMsgBatch;
 use crate::store::fsm::GenSnapTask;
 use crate::store::util;
 use crate::store::ProposalContext;
@@ -33,7 +37,7 @@ use super::metrics::*;
 use super::worker::RegionTask;
 use super::{SnapEntry, SnapKey, SnapManager, SnapshotStatistics};
 
-use crate::store::fsm::async_io::AsyncWriter;
+use crate::store::fsm::async_io::{AsyncWriteMsg, AsyncWriteTask, UnsyncedReady};
 
 // When we create a region peer, we should initialize its log term/index > 0,
 // so that we can force the follower peer to sync the snapshot first.
@@ -300,12 +304,8 @@ impl Drop for EntryCache {
     }
 }
 
-pub trait HandleRaftReadyContext<EK, ER>
-where
-    EK: KvEngine,
-    ER: RaftEngine,
-{
-    fn async_writer(&mut self, id: usize) -> (&AsyncWriter<EK, ER>, &mut StoreIOLockMetrics);
+pub trait HandleRaftReadyContext {
+    fn async_write_batch(&mut self, id: usize) -> &mut AsyncWriteMsgBatch;
     fn sync_log(&self) -> bool;
     fn set_sync_log(&mut self, sync: bool);
 }
@@ -1025,8 +1025,11 @@ where
         &mut self,
         invoke_ctx: &mut InvokeContext,
         entries: Vec<Entry>,
-        raft_wb: &mut ER::LogBatch,
-    ) -> Result<u64> {
+        task: &mut AsyncWriteTask,
+    ) {
+        if entries.is_empty() {
+            return;
+        }
         let region_id = self.get_region_id();
         debug!(
             "append entries";
@@ -1035,9 +1038,6 @@ where
             "count" => entries.len(),
         );
         let prev_last_index = invoke_ctx.raft_state.get_last_index();
-        if entries.is_empty() {
-            return Ok(prev_last_index);
-        }
 
         invoke_ctx.has_new_entries = true;
 
@@ -1053,15 +1053,18 @@ where
             cache.append(&self.tag, &entries);
         }
 
-        raft_wb.append(region_id, entries)?;
+        task.size += entries
+            .iter()
+            .map(|e| e.compute_size() as usize)
+            .sum::<usize>();
+        task.entries = entries;
+        task.cut_logs = Some((last_index + 1, prev_last_index));
+
         // Delete any previously appended log entries which never committed.
         // TODO: Wrap it as an engine::Error.
-        raft_wb.cut_logs(region_id, last_index + 1, prev_last_index);
 
         invoke_ctx.raft_state.set_last_index(last_index);
         invoke_ctx.last_term = last_term;
-
-        Ok(last_index)
     }
 
     pub fn compact_to(&mut self, idx: u64) {
@@ -1374,30 +1377,35 @@ where
     /// it explicitly to disk. If it's flushed to disk successfully, `post_ready` should be called
     /// to update the memory states properly.
     /// WARNING: If this function returns error, the caller must panic(details in `append` function).
-    pub fn handle_raft_ready<H: HandleRaftReadyContext<EK, ER>>(
+    pub fn handle_raft_ready<H: HandleRaftReadyContext>(
         &mut self,
         ready_ctx: &mut H,
         ready: &mut Ready,
         destroy_regions: Vec<metapb::Region>,
         async_writer_id: usize,
+        msgs: Vec<RaftMessage>,
+        msg_seq_id: usize,
         proposal_times: Vec<Instant>,
     ) -> Result<InvokeContext> {
         let region_id = self.get_region_id();
         let mut ctx = InvokeContext::new(self);
         let mut snapshot_index = 0;
 
-        let (async_writer, io_lock_metrics) = ready_ctx.async_writer(async_writer_id);
-        let wait_lock = UtilInstant::now();
-        let mut locked_writer = async_writer.0.lock().unwrap();
-        let hold_lock = UtilInstant::now();
+        let mut write_task = AsyncWriteTask::new(region_id);
 
-        io_lock_metrics
-            .wait_lock_sec
-            .observe(duration_to_sec(wait_lock.elapsed()) as f64);
+        if !ready.entries().is_empty() {
+            self.append(&mut ctx, ready.take_entries(), &mut write_task);
+        }
 
-        let current = locked_writer.prepare_current_for_write();
+        // Last index is 0 means the peer is created from raft message
+        // and has not applied snapshot yet, so skip persistent hard state.
+        if ctx.raft_state.get_last_index() > 0 {
+            if let Some(hs) = ready.hs() {
+                ctx.raft_state.set_hard_state(hs.clone());
+            }
+        }
 
-        if !ready.snapshot().is_empty() {
+        /*if !ready.snapshot().is_empty() {
             fail_point!("raft_before_apply_snap");
             self.apply_snapshot(
                 &mut ctx,
@@ -1409,49 +1417,44 @@ where
             fail_point!("raft_after_apply_snap");
             ctx.destroyed_regions = destroy_regions;
             snapshot_index = last_index(&ctx.raft_state);
-        };
-
-        if !ready.entries().is_empty() {
-            self.append(&mut ctx, ready.take_entries(), &mut current.raft_wb)?;
-        }
-        // Last index is 0 means the peer is created from raft message
-        // and has not applied snapshot yet, so skip persistent hard state.
-        if ctx.raft_state.get_last_index() > 0 {
-            if let Some(hs) = ready.hs() {
-                ctx.raft_state.set_hard_state(hs.clone());
-            }
-        }
+        };*/
 
         // Save raft state if it has changed or there is a snapshot.
         if ctx.raft_state != self.raft_state || snapshot_index > 0 {
-            ctx.save_raft_state_to(&mut current.raft_wb)?;
+            write_task.raft_state = Some(ctx.raft_state.clone());
+            write_task.size += 4 * 8;
+            //ctx.save_raft_state_to(&mut current.raft_wb)?;
         }
 
         // only when apply snapshot
-        if snapshot_index > 0 {
+        /*if snapshot_index > 0 {
             // in case of restart happen when we just write region state to Applying,
             // but not write raft_local_state to raft rocksdb in time.
             // we write raft state to default rocksdb, with last index set to snap index,
             // in case of recv raft log after snapshot.
             ctx.save_snapshot_raft_state_to(snapshot_index, &mut current.kv_wb)?;
             ctx.save_apply_state_to(&mut current.kv_wb)?;
-        }
+        }*/
 
         if ready.must_sync() {
-            current.update_ready(region_id, self.peer_id, ready.number());
+            write_task.unsynced_ready = Some(UnsyncedReady::new(self.peer_id, ready.number()));
         }
 
         for ts in &proposal_times {
             STORE_TO_WRITE_QUEUE_DURATION_HISTOGRAM.observe(duration_to_sec(ts.elapsed()));
-            current.proposal_times.push(*ts);
         }
+        write_task.proposal_times = proposal_times;
+        write_task.messages = msgs;
+        write_task.msg_seq_id = msg_seq_id;
 
-        if locked_writer.should_notify() {
-            async_writer.1.notify_one();
+        if !write_task.is_empty() {
+            let batch = ready_ctx.async_write_batch(async_writer_id);
+            if batch.msgs.is_empty() {
+                batch.begin = Some(Instant::now());
+            }
+            batch.size += write_task.size;
+            batch.msgs.push(AsyncWriteMsg::WriteTask(write_task));
         }
-        io_lock_metrics
-            .hold_lock_sec
-            .observe(duration_to_sec(hold_lock.elapsed()) as f64);
 
         Ok(ctx)
     }

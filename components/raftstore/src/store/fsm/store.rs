@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use std::{thread, u64};
 
 use batch_system::{BasicMailbox, BatchRouter, BatchSystem, Fsm, HandlerBuilder, PollHandler};
-use crossbeam::channel::{TryRecvError, TrySendError};
+use crossbeam::channel::{Sender, TryRecvError, TrySendError};
 //use engine_rocks::{PerfContext, PerfLevel};
 use engine_traits::{Engines, KvEngine, Mutable, WriteBatch};
 use engine_traits::{CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
@@ -80,7 +80,7 @@ pub const PENDING_MSG_CAP: usize = 100;
 const UNREACHABLE_BACKOFF: Duration = Duration::from_secs(10);
 
 use crate::store::fsm::apply_async_io::{ApplyAsyncWriter, ApplyAsyncWriters};
-use crate::store::fsm::async_io::{AsyncWriter, AsyncWriters};
+use crate::store::fsm::async_io::{AsyncWriteMsg, AsyncWriters};
 
 pub struct StoreInfo<E> {
     pub engine: E,
@@ -290,6 +290,22 @@ impl Clone for PeerTickBatch {
     }
 }
 
+pub struct AsyncWriteMsgBatch {
+    pub msgs: Vec<AsyncWriteMsg>,
+    pub begin: Option<Instant>,
+    pub size: usize,
+}
+
+impl AsyncWriteMsgBatch {
+    fn new() -> Self {
+        Self {
+            msgs: vec![],
+            begin: None,
+            size: 0,
+        }
+    }
+}
+
 pub struct PollContext<EK, ER, T>
 where
     EK: KvEngine,
@@ -336,18 +352,19 @@ where
     pub perf_context_statistics: PerfContextStatistics,
     pub tick_batch: Vec<PeerTickBatch>,
     pub node_start_time: Option<TiInstant>,
-    pub async_writers: Vec<AsyncWriter<EK, ER>>,
+    pub async_write_senders: Vec<Sender<Vec<AsyncWriteMsg>>>,
+    pub async_write_msg_batch: Vec<AsyncWriteMsgBatch>,
     pub io_lock_metrics: StoreIOLockMetrics,
 }
 
-impl<EK, ER, T> HandleRaftReadyContext<EK, ER> for PollContext<EK, ER, T>
+impl<EK, ER, T> HandleRaftReadyContext for PollContext<EK, ER, T>
 where
     EK: KvEngine,
     ER: RaftEngine,
 {
     #[inline]
-    fn async_writer(&mut self, id: usize) -> (&AsyncWriter<EK, ER>, &mut StoreIOLockMetrics) {
-        (&self.async_writers[id], &mut self.io_lock_metrics)
+    fn async_write_batch(&mut self, id: usize) -> &mut AsyncWriteMsgBatch {
+        &mut self.async_write_msg_batch[id]
     }
 
     #[inline]
@@ -463,7 +480,7 @@ where
         } else {
             gc_msg.set_is_tombstone(true);
         }
-        if let Err(e) = self.trans.send(gc_msg) {
+        if let Err(e) = self.trans.send(None, gc_msg) {
             error!(?e;
                 "send gc message failed";
                 "region_id" => region_id,
@@ -621,9 +638,8 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
         // Only enable the fail point when the store id is equal to 3, which is
         // the id of slow store in tests.
         fail_point!("on_raft_ready", self.poll_ctx.store_id() == 3, |_| {});
-        if self.poll_ctx.trans.need_flush() {
-            self.poll_ctx.trans.flush();
-        }
+        self.poll_ctx.trans.try_flush();
+        self.maybe_flush_async_write(false);
 
         // TODO(ASYNC_IO): change the logic
         let dur = self.timer.elapsed();
@@ -674,6 +690,51 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
                 });
             poll_future_notify(f);
         }
+    }
+
+    pub fn maybe_flush_async_write(&mut self, force: bool) {
+        let now = Instant::now();
+        let delay_time = Duration::from_micros(self.poll_ctx.cfg.trigger_send_io_time_us);
+
+        for (i, batch) in self.poll_ctx.async_write_msg_batch.iter_mut().enumerate() {
+            if batch.msgs.is_empty() {
+                continue;
+            }
+            if !(force
+                || now - batch.begin.unwrap() >= delay_time
+                || batch.size >= self.poll_ctx.cfg.trigger_send_io_size.0 as usize)
+            {
+                continue;
+            }
+            if !force {
+                STORE_WRITE_TRIGGER_SEND_DURATION_HISTOGRAM
+                    .observe(duration_to_sec(now - batch.begin.unwrap()));
+                STORE_WRITE_TRIGGER_SEND_BYTES_HISTOGRAM.observe(batch.size as f64);
+            } else {
+                STORE_WRITE_FORCE_TRIGGER_SEND_DURATION_HISTOGRAM
+                    .observe(duration_to_sec(now - batch.begin.unwrap()));
+                STORE_WRITE_FORCE_TRIGGER_SEND_BYTES_HISTOGRAM.observe(batch.size as f64);
+            }
+            for m in &batch.msgs {
+                if let AsyncWriteMsg::WriteTask(task) = m {
+                    for ts in &task.proposal_times {
+                        STORE_WRITE_FORCE_TRIGGER_SEND_DURATION_HISTOGRAM
+                            .observe(duration_to_sec(now - *ts));
+                    }
+                }
+            }
+
+            let msg = std::mem::take(&mut batch.msgs);
+            if let Err(e) = self.poll_ctx.async_write_senders[i].send(msg) {
+                panic!("{} failed to send write msg, err: {:?}", self.tag, e);
+            }
+            batch.begin = None;
+            batch.size = 0;
+        }
+        self.poll_ctx
+            .io_lock_metrics
+            .hold_lock_sec
+            .observe(duration_to_sec(now.elapsed()) as f64);
     }
 }
 
@@ -726,6 +787,9 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport>
         let mut delegate = PeerFsmDelegate::new(peer, &mut self.poll_ctx);
         delegate.handle_msgs(&mut self.peer_msg_buf);
         delegate.collect_ready();
+        self.poll_ctx.trans.try_flush();
+        self.maybe_flush_async_write(false);
+        expected_msg_count
     }
 
     fn end(&mut self, peers: &mut HashMap<u64, Box<PeerFsm<EK, ER>>>) {
@@ -745,10 +809,13 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport>
         self.poll_ctx.io_lock_metrics.flush();
     }
 
-    fn pause(&mut self) {
-        if self.poll_ctx.trans.need_flush() {
-            self.poll_ctx.trans.flush();
-        }
+    fn pause(&mut self) -> bool {
+        self.poll_ctx.trans.flush();
+        self.maybe_flush_async_write(true);
+        // If there are cached data and go into pause status, that will cause high latency or hunger
+        // so it should return false(means pause failed) when there are still jobs to do
+        //all_synced_and_flushed
+        true
     }
 }
 
@@ -778,7 +845,7 @@ where
     pub engines: Engines<EK, ER>,
     applying_snap_count: Arc<AtomicUsize>,
     global_replication_state: Arc<Mutex<GlobalReplicationState>>,
-    async_writers: Vec<AsyncWriter<EK, ER>>,
+    async_write_senders: Vec<Sender<Vec<AsyncWriteMsg>>>,
     pub apply_async_writers: Vec<ApplyAsyncWriter<EK, W>>,
 }
 
@@ -969,6 +1036,10 @@ where
     type Handler = RaftPoller<EK, ER, T>;
 
     fn build(&mut self) -> RaftPoller<EK, ER, T> {
+        let mut async_write_msg_batch = vec![];
+        for _ in 0..self.async_write_senders.len() {
+            async_write_msg_batch.push(AsyncWriteMsgBatch::new());
+        }
         let mut ctx = PollContext {
             cfg: self.cfg.value().clone(),
             store: self.store.clone(),
@@ -1001,7 +1072,8 @@ where
             perf_context_statistics: PerfContextStatistics::new(self.cfg.value().perf_level),
             tick_batch: vec![PeerTickBatch::default(); 256],
             node_start_time: Some(TiInstant::now_coarse()),
-            async_writers: self.async_writers.clone(),
+            async_write_senders: self.async_write_senders.clone(),
+            async_write_msg_batch,
             io_lock_metrics: StoreIOLockMetrics::default(),
         };
         ctx.update_ticks_timeout();
@@ -1045,7 +1117,7 @@ where
     apply_system: ApplyBatchSystem<EK>,
     router: RaftRouter<EK, ER>,
     workers: Option<Workers<EK>>,
-    async_writers: AsyncWriters<EK, ER>,
+    async_writers: AsyncWriters,
     apply_async_writers: ApplyAsyncWriters<EK, W>,
 }
 
@@ -1135,6 +1207,7 @@ where
             &engines.kv,
             &engines.raft,
             &self.router,
+            &trans,
             &cfg.value(),
         )?;
 
@@ -1167,7 +1240,7 @@ where
             store_meta,
             pending_create_peers: Arc::new(Mutex::new(HashMap::default())),
             applying_snap_count: Arc::new(AtomicUsize::new(0)),
-            async_writers: self.async_writers.writers().clone(),
+            async_write_senders: self.async_writers.senders().clone(),
             apply_async_writers: self.apply_async_writers.writers().clone(),
         };
         let region_peers = builder.init()?;
@@ -1409,7 +1482,7 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> StoreFsmDelegate<'a, EK, ER
                 let extra_msg = send_msg.mut_extra_msg();
                 extra_msg.set_type(ExtraMessageType::MsgCheckStalePeerResponse);
                 extra_msg.set_check_peers(region.get_peers().into());
-                if let Err(e) = self.ctx.trans.send(send_msg) {
+                if let Err(e) = self.ctx.trans.send(None, send_msg) {
                     error!(?e;
                         "send check stale peer response message failed";
                         "region_id" => region_id,

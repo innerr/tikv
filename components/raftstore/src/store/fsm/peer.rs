@@ -350,8 +350,15 @@ where
         false
     }
 
-    fn build(&mut self, metric: &mut RaftProposeMetrics) -> Option<RaftCommand<E::Snapshot>> {
+    fn build(
+        &mut self,
+        metric: &mut RaftProposeMetrics,
+        is_end: bool,
+    ) -> Option<RaftCommand<E::Snapshot>> {
         if let Some(req) = self.request.take() {
+            if is_end {
+                metric.end_batch += 1;
+            }
             self.batch_req_size = 0;
             if self.callbacks.len() == 1 {
                 let (mut cb, _, send_time) = self.callbacks.pop().unwrap();
@@ -508,11 +515,11 @@ where
                     {
                         self.fsm.batch_req_builder.add(cmd, req_size);
                         if self.fsm.batch_req_builder.should_finish() {
-                            self.propose_batch_raft_command();
+                            self.propose_batch_raft_command(false);
                         }
                     } else {
-                        self.propose_batch_raft_command();
-                        self.propose_raft_command(cmd.request, cmd.callback)
+                        self.propose_batch_raft_command(false);
+                        self.propose_raft_command(cmd.request, cmd.callback);
                     }
                 }
                 PeerMsg::Tick(tick) => self.on_tick(tick),
@@ -554,16 +561,16 @@ where
             }
         }
         // Propose batch request which may be still waiting for more raft-command
-        self.propose_batch_raft_command();
+        self.propose_batch_raft_command(true);
     }
 
-    fn propose_batch_raft_command(&mut self) {
+    fn propose_batch_raft_command(&mut self, is_end: bool) {
         if let Some(cmd) = self
             .fsm
             .batch_req_builder
-            .build(&mut self.ctx.raft_metrics.propose)
+            .build(&mut self.ctx.raft_metrics.propose, is_end)
         {
-            self.propose_raft_command(cmd.request, cmd.callback)
+            self.propose_raft_command(cmd.request, cmd.callback);
         }
     }
 
@@ -1052,7 +1059,7 @@ where
         // When having pending snapshot, if election timeout is met, it can't pass
         // the pending conf change check because first index has been updated to
         // a value that is larger than last index.
-        if self.fsm.peer.is_applying_snapshot() || self.fsm.peer.has_pending_snapshot() {
+        if self.fsm.peer.is_applying_snapshot_strictly() || self.fsm.peer.has_pending_snapshot() {
             // need to check if snapshot is applied.
             self.fsm.has_ready = true;
             self.fsm.missing_ticks = 0;
@@ -3262,16 +3269,15 @@ where
         let mut resp = RaftCmdResponse::default();
         let term = self.fsm.peer.term();
         bind_term(&mut resp, term);
+
         if self.fsm.peer.propose(self.ctx, cb, msg, resp) {
             self.fsm.has_ready = true;
         }
-
         if self.fsm.peer.should_wake_up {
             self.reset_raft_tick(GroupState::Ordered);
         }
 
         self.register_pd_heartbeat_tick();
-
         // TODO: add timeout, if the command is not applied after timeout,
         // we will call the callback with timeout error.
     }
