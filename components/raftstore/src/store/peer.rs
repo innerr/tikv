@@ -1,7 +1,8 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use rand::Rng;
+use seahash::SeaHasher;
 use std::collections::VecDeque;
+use std::hash::Hasher;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -497,12 +498,8 @@ where
     /// (The number of ready which has a snapshot, Whether this snapshot is scheduled)
     snapshot_ready_status: (u64, bool),
     persisted_number: u64,
-    /// Used for async writer id, raft client
-    /// io thread must consume the io request before this peer has been destroyed.
-    /// But grpc thread doesn't has this feature so the msg may be reorder if a new peer
-    /// with the same region id is created after this peer is destroyed.
-    /// TODO: should think it twice(peer id is different so it should be no problem)
-    random_id: usize,
+    /// The choose id of async writer thread
+    async_writer_id: usize,
 }
 
 impl<EK, ER> Peer<EK, ER>
@@ -545,6 +542,11 @@ where
 
         let logger = slog_global::get_global().new(slog::o!("region_id" => region.get_id()));
         let raft_group = RawNode::new(&raft_cfg, ps, &logger)?;
+        let async_writer_id = {
+            let mut hasher = SeaHasher::new();
+            hasher.write_u64(region.get_id());
+            hasher.finish() as usize % cfg.store_io_pool_size
+        };
         let mut peer = Peer {
             peer,
             region_id: region.get_id(),
@@ -598,7 +600,7 @@ where
             unpersisted_numbers: VecDeque::default(),
             snapshot_ready_status: (0, false),
             persisted_number: 0,
-            random_id: rand::thread_rng().gen(),
+            async_writer_id,
         };
 
         // If this region has only one peer and I am the one, campaign directly.
@@ -1625,7 +1627,6 @@ where
         &mut self,
         ctx: &mut PollContext<EK, ER, T>,
     ) -> Option<(Ready, InvokeContext)> {
-        let now = Instant::now();
         if self.pending_remove {
             return None;
         }
@@ -1788,16 +1789,13 @@ where
 
         self.apply_reads(ctx, &ready);
 
-        let async_writer_id = self.random_id % ctx.async_write_senders.len();
-        let msg_seq_id = self.random_id;
-
+        let async_writer_id = self.async_writer_id;
         let invoke_ctx = match self.mut_store().handle_raft_ready(
             ctx,
             &mut ready,
             destroy_regions,
             async_writer_id,
             msgs,
-            msg_seq_id,
             proposal_times,
         ) {
             Ok(r) => r,
@@ -3522,7 +3520,7 @@ where
             let to_peer_id = msg.get_to_peer().get_id();
             let to_store_id = msg.get_to_peer().get_store_id();
             let msg_type = msg.get_message().get_msg_type();
-            if let Err(e) = trans.send(Some(self.random_id), msg) {
+            if let Err(e) = trans.send(msg) {
                 warn!(
                     "failed to send msg to other peer";
                     "region_id" => self.region_id,
@@ -3566,7 +3564,7 @@ where
         send_msg.set_to_peer(peer.clone());
         let extra_msg = send_msg.mut_extra_msg();
         extra_msg.set_type(ExtraMessageType::MsgRegionWakeUp);
-        if let Err(e) = ctx.trans.send(Some(self.random_id), send_msg) {
+        if let Err(e) = ctx.trans.send(send_msg) {
             error!(?e;
                 "failed to send wake up message";
                 "region_id" => self.region_id,
@@ -3596,7 +3594,7 @@ where
             send_msg.set_to_peer(peer.clone());
             let extra_msg = send_msg.mut_extra_msg();
             extra_msg.set_type(ExtraMessageType::MsgCheckStalePeer);
-            if let Err(e) = ctx.trans.send(Some(self.random_id), send_msg) {
+            if let Err(e) = ctx.trans.send(send_msg) {
                 error!(?e;
                     "failed to send check stale peer message";
                     "region_id" => self.region_id,
@@ -3644,7 +3642,7 @@ where
         let extra_msg = send_msg.mut_extra_msg();
         extra_msg.set_type(ExtraMessageType::MsgWantRollbackMerge);
         extra_msg.set_premerge_commit(premerge_commit);
-        if let Err(e) = ctx.trans.send(Some(self.random_id), send_msg) {
+        if let Err(e) = ctx.trans.send(send_msg) {
             error!(?e;
                 "failed to send want rollback merge message";
                 "region_id" => self.region_id,

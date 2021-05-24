@@ -3,12 +3,10 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::Instant;
 use std::{cmp, error, u64};
-
-use crossbeam::channel::{SendError, Sender};
 
 use engine_traits::CF_RAFT;
 use engine_traits::{Engines, KvEngine, Mutable, Peekable};
@@ -22,17 +20,15 @@ use protobuf::Message;
 use raft::eraftpb::{ConfState, Entry, HardState, Snapshot};
 use raft::{self, Error as RaftError, RaftState, Ready, Storage, StorageError};
 
-use crate::store::fsm::store::AsyncWriteMsgBatch;
 use crate::store::fsm::GenSnapTask;
 use crate::store::util;
 use crate::store::ProposalContext;
 use crate::{Error, Result};
 use engine_traits::{RaftEngine, RaftLogBatch};
 use into_other::into_other;
-use tikv_util::time::{duration_to_sec, Instant as UtilInstant};
+use tikv_util::time::duration_to_sec;
 use tikv_util::worker::Scheduler;
 
-use super::local_metrics::StoreIOLockMetrics;
 use super::metrics::*;
 use super::worker::RegionTask;
 use super::{SnapEntry, SnapKey, SnapManager, SnapshotStatistics};
@@ -304,8 +300,12 @@ impl Drop for EntryCache {
     }
 }
 
-pub trait HandleRaftReadyContext {
-    fn async_write_batch(&mut self, id: usize) -> &mut AsyncWriteMsgBatch;
+pub trait HandleRaftReadyContext<EK, ER>
+where
+    EK: KvEngine,
+    ER: RaftEngine,
+{
+    fn async_write_sender(&self, id: usize) -> &Sender<AsyncWriteMsg<EK, ER>>;
     fn sync_log(&self) -> bool;
     fn set_sync_log(&mut self, sync: bool);
 }
@@ -1025,7 +1025,7 @@ where
         &mut self,
         invoke_ctx: &mut InvokeContext,
         entries: Vec<Entry>,
-        task: &mut AsyncWriteTask,
+        task: &mut AsyncWriteTask<EK, ER>,
     ) {
         if entries.is_empty() {
             return;
@@ -1053,10 +1053,6 @@ where
             cache.append(&self.tag, &entries);
         }
 
-        task.size += entries
-            .iter()
-            .map(|e| e.compute_size() as usize)
-            .sum::<usize>();
         task.entries = entries;
         task.cut_logs = Some((last_index + 1, prev_last_index));
 
@@ -1125,8 +1121,7 @@ where
         &mut self,
         ctx: &mut InvokeContext,
         snap: &Snapshot,
-        kv_wb: &mut EK::WriteBatch,
-        raft_wb: &mut ER::LogBatch,
+        task: &mut AsyncWriteTask<EK, ER>,
         destroy_regions: &[metapb::Region],
     ) -> Result<()> {
         info!(
@@ -1148,6 +1143,15 @@ where
                 region.get_id()
             ));
         }
+
+        if task.raft_wb.is_none() {
+            task.raft_wb = Some(self.engines.raft.log_batch(64));
+        }
+        if task.kv_wb.is_none() {
+            task.kv_wb = Some(self.engines.kv.write_batch());
+        }
+        let raft_wb = task.raft_wb.as_mut().unwrap();
+        let kv_wb = task.kv_wb.as_mut().unwrap();
 
         if self.is_initialized() {
             // we can only delete the old data when the peer is initialized.
@@ -1171,6 +1175,13 @@ where
         ctx.apply_state
             .mut_truncated_state()
             .set_term(snap.get_metadata().get_term());
+
+        // in case of restart happen when we just write region state to Applying,
+        // but not write raft_local_state to raft rocksdb in time.
+        // we write raft state to default rocksdb, with last index set to snap index,
+        // in case of recv raft log after snapshot.
+        ctx.save_snapshot_raft_state_to(last_index, kv_wb)?;
+        ctx.save_apply_state_to(kv_wb)?;
 
         info!(
             "apply snapshot with state ok";
@@ -1377,19 +1388,17 @@ where
     /// it explicitly to disk. If it's flushed to disk successfully, `post_ready` should be called
     /// to update the memory states properly.
     /// WARNING: If this function returns error, the caller must panic(details in `append` function).
-    pub fn handle_raft_ready<H: HandleRaftReadyContext>(
+    pub fn handle_raft_ready<H: HandleRaftReadyContext<EK, ER>>(
         &mut self,
         ready_ctx: &mut H,
         ready: &mut Ready,
         destroy_regions: Vec<metapb::Region>,
         async_writer_id: usize,
         msgs: Vec<RaftMessage>,
-        msg_seq_id: usize,
         proposal_times: Vec<Instant>,
     ) -> Result<InvokeContext> {
         let region_id = self.get_region_id();
         let mut ctx = InvokeContext::new(self);
-        let mut snapshot_index = 0;
 
         let mut write_task = AsyncWriteTask::new(region_id);
 
@@ -1405,36 +1414,22 @@ where
             }
         }
 
-        /*if !ready.snapshot().is_empty() {
+        if !ready.snapshot().is_empty() {
             fail_point!("raft_before_apply_snap");
             self.apply_snapshot(
                 &mut ctx,
                 ready.snapshot(),
-                &mut current.kv_wb,
-                &mut current.raft_wb,
+                &mut write_task,
                 &destroy_regions,
             )?;
             fail_point!("raft_after_apply_snap");
             ctx.destroyed_regions = destroy_regions;
-            snapshot_index = last_index(&ctx.raft_state);
-        };*/
+        };
 
         // Save raft state if it has changed or there is a snapshot.
-        if ctx.raft_state != self.raft_state || snapshot_index > 0 {
+        if ctx.raft_state != self.raft_state || !ready.snapshot().is_empty() {
             write_task.raft_state = Some(ctx.raft_state.clone());
-            write_task.size += 4 * 8;
-            //ctx.save_raft_state_to(&mut current.raft_wb)?;
         }
-
-        // only when apply snapshot
-        /*if snapshot_index > 0 {
-            // in case of restart happen when we just write region state to Applying,
-            // but not write raft_local_state to raft rocksdb in time.
-            // we write raft state to default rocksdb, with last index set to snap index,
-            // in case of recv raft log after snapshot.
-            ctx.save_snapshot_raft_state_to(snapshot_index, &mut current.kv_wb)?;
-            ctx.save_apply_state_to(&mut current.kv_wb)?;
-        }*/
 
         if ready.must_sync() {
             write_task.unsynced_ready = Some(UnsyncedReady::new(self.peer_id, ready.number()));
@@ -1445,15 +1440,12 @@ where
         }
         write_task.proposal_times = proposal_times;
         write_task.messages = msgs;
-        write_task.msg_seq_id = msg_seq_id;
 
         if !write_task.is_empty() {
-            let batch = ready_ctx.async_write_batch(async_writer_id);
-            if batch.msgs.is_empty() {
-                batch.begin = Some(Instant::now());
+            let sender = ready_ctx.async_write_sender(async_writer_id);
+            if let Err(e) = sender.send(AsyncWriteMsg::WriteTask(write_task)) {
+                panic!("{} failed to send write msg, err: {:?}", self.tag, e);
             }
-            batch.size += write_task.size;
-            batch.msgs.push(AsyncWriteMsg::WriteTask(write_task));
         }
 
         Ok(ctx)
